@@ -2,6 +2,8 @@ import re
 import nltk
 from nltk.tokenize import sent_tokenize
 
+nltk.download('punkt_tab', quiet=True)
+
 def split_transcript(text: str) -> dict:
     # Each marker is paired with a list of exclusion phrases.
     # If any exclusion phrase surrounds the match, it's skipped.
@@ -71,8 +73,6 @@ def clean_text(text: str) -> str:
     return text
 
 def sentence_tokenize(text: str) -> list:
-    # downloads tokenizer model and suppresses download progress output
-    nltk.download('punkt_tab', quiet=True)
     # strips whitespace and tokenizes sentences
     # removes sentences with 4 or fewer words (most likely headers)
     return [s.strip() for s in sent_tokenize(text) if len(s.split()) > 4]

@@ -1,25 +1,101 @@
+import argparse
+from datetime import datetime
+
 import webscraper as ws
 import preprocessing as pp
 import sentiment_scoring as scr
+import signal_constructor as sc
+import persistence
+
+# helper to run a single transcript through the processing pipeline
+def _run_pipeline(data: dict, ticker: str, date: str, scorer: scr.FinBERTScorer) -> dict:
+    # splits raw text into prepared and qa sections
+    split_text = pp.split_transcript(data["text"])
+    # cleans each section
+    cleaned = {
+        "prepared": pp.clean_text(split_text["prepared"]),
+        "qa": pp.clean_text(split_text["qa"]),
+    }
+    # breaks each section into individual sentences
+    tokenized = {
+        "prepared": pp.sentence_tokenize(cleaned["prepared"]),
+        "qa": pp.sentence_tokenize(cleaned["qa"]),
+    }
+    # runs sentiment analysis on the tokenized sections
+    scored = scr.score_transcript(tokenized, ticker, date, scorer)
+    scored["date"] = scored["date"][:10]
+    return scored
 
 def main():
-    results = ws.scrape_all_transcripts()
-    tickers_list = list(results.keys())
+    parser = argparse.ArgumentParser()
+    # lets us control whether we are running bootstrap or daily version from CLI
+    parser.add_argument("--bootstrap", action="store_true",
+                        help="Scrape historical transcripts across many pages")
+    parser.add_argument("--pages", type=int, default=40,
+                        help="Number of listing pages to scrape in bootstrap mode (default: 40)")
+    args = parser.parse_args()
+
+    # loads previously saved scores from disk
+    all_records = persistence.load_scores()
+    # builds set of already scored (ticker, date) pairs
+    already_scored = persistence.get_scored_keys(all_records)
+    # initializes FinBERT model
     scorer = scr.FinBERTScorer()
 
-    for i, ticker in enumerate(tickers_list):
-        print(f">> {i} - {ticker}")
+    # bootstrap branch
+    if args.bootstrap:
+        raw = ws.scrape_historical_transcripts(
+            n_pages=args.pages,
+            already_scored=already_scored,
+        )
+        total = len(raw)
+        for i, ((ticker, date_str), data) in enumerate(raw.items()):
+            print(f"[{i+1}/{total}] Scoring {ticker} ({date_str})...")
+            try:
+                scored = _run_pipeline(data, ticker, date_str, scorer)
+                all_records.append(scored)
+            except Exception as e:
+                print(f" > Error scoring {ticker} ({date_str}): {e}")
+            # saves scores every 10 transcripts as a checkpoint
+            if (i + 1) % 10 == 0:
+                persistence.save_scores(all_records)
+        # final save at the end
+        persistence.save_scores(all_records)
+    # daily branch
+    else:
+        today = str(datetime.today().date())
+        raw = ws.scrape_all_transcripts()
+        for ticker, data in raw.items():
+            if (ticker, today) in already_scored:
+                print(f"Already scored {ticker} today, skipping.")
+                continue
+            print(f"Scoring {ticker}...")
+            try:
+                scored = _run_pipeline(data, ticker, today, scorer)
+                all_records.append(scored)
+            except Exception as e:
+                print(f" > Error scoring {ticker}: {e}")
+        persistence.save_scores(all_records)
 
-        split_text = pp.split_transcript(results[ticker]['text'])
-        cleaned_text = {"prepared": pp.clean_text(split_text["prepared"]),
-                        "qa": pp.clean_text(split_text["qa"])}
-        tokenized_text = {"prepared": pp.sentence_tokenize(cleaned_text["prepared"]),
-                          "qa": pp.sentence_tokenize(cleaned_text["qa"])}
+    # Signal generation
+    signal = sc.SentimentSignal()
+    # provides history in SentimentSignal class with historical results
+    for record in all_records:
+        signal.add_score(record)
 
-        scores = scr.score_transcript(tokenized_text, ticker, results[ticker]["date"], scorer)
+    # deduplicated list of tickers (extract tickers -> set -> list)
+    tickers = list({r["ticker"] for r in all_records})
+    if not tickers:
+        print("No scored transcripts found. Run with --bootstrap first.")
+        return
 
-        print(f"Prepared score: {scores['prepared']}\nQA score: {scores['qa']}"
-              f"\nComposite score: {scores['composite']}")
+    df = signal.rank_universe(tickers) # ranked df of candidate tickers
+    print("\n=== Signal Rankings ===")
+    print(df.round(4).to_string(index=False))
+    df.to_csv("signals_output.csv", index=False)
+
+    investable = signal.get_investable_universe(tickers)
+    print(f"\nTop 20% investable universe ({len(investable)} tickers): {investable}")
 
 if __name__ == "__main__":
     main()
