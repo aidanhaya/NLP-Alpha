@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter
 from datetime import datetime
 
 import webscraper as ws
@@ -76,6 +77,30 @@ def main():
             except Exception as e:
                 print(f" > Error scoring {ticker}: {e}")
         persistence.save_scores(all_records)
+
+        # For any ticker from today's scrape that is below the threshold,
+        # immediately backfill its history via the quote page scraper.
+        # counts is a frequency for how many transcripts are recorded per ticker
+        counts = Counter(r["ticker"] for r in all_records)
+        # filters daily tickers to find those with fewer than 8 total records
+        needs_backfill = [t for t in raw if counts.get(t, 0) < 8]
+        if needs_backfill:
+            print(f"Backfilling history for {len(needs_backfill)} tickers below {8} records: {needs_backfill}")
+            # fetches set of (ticker, date) pairs that have already been scored
+            already_scored = persistence.get_scored_keys(all_records)
+            backfill_raw = ws.scrape_ticker_history(
+                tickers=needs_backfill,
+                already_scored=already_scored,
+            )
+            # tuple key = (ticker, date_str)
+            # value = data
+            for (ticker, date_str), data in backfill_raw.items():
+                try:
+                    scored = _run_pipeline(data, ticker, date_str, scorer)
+                    all_records.append(scored)
+                except Exception as e:
+                    print(f" > Error scoring {ticker} ({date_str}): {e}")
+            persistence.save_scores(all_records)
 
     # Signal generation
     signal = sc.SentimentSignal()

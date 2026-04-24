@@ -98,6 +98,123 @@ def scrape_all_transcripts(delay: float = 2.0) -> dict:
 
     return results
 
+def scrape_ticker_history(
+    tickers: list,
+    already_scored: set = None,
+    delay: float = 2.0,
+) -> dict:
+    """
+    For each ticker, navigates to its Motley Fool quote page, opens the
+    Earnings Transcripts tab, and scrapes all available transcript history.
+
+    URL pattern tried per ticker: fool.com/quote/{exchange}/{ticker}/{ticker}/
+    Exchanges attempted in order: nasdaq, nyse, crypto.
+    Falls back gracefully if the quote page is not found.
+    """
+    if already_scored is None:
+        already_scored = set()
+
+    pattern = re.compile(
+        r"/earnings/call-transcripts/\d{4}/\d{2}/\d{2}/"
+        r"(?:[a-z0-9]+-)*"
+        r"([A-Z]{1,5}|[a-z]{1,5})"
+        r"-q[1-4]-\d{4}"
+        r"-earnings(?:-call)?-transcript/"
+    )
+    date_pattern = re.compile(r"/earnings/call-transcripts/(\d{4})/(\d{2})/(\d{2})/")
+
+    results = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        for ticker in tickers:
+            t = ticker.lower()
+            print(f"Looking up transcript history for {ticker}...")
+
+            # Step 1: Find the working quote page URL by trying common exchanges
+            quote_url = None
+            for exchange in ["nasdaq", "nyse", "amex"]:
+                candidate = f"https://www.fool.com/quote/{exchange}/{t}/{t}/"
+                try:
+                    response = page.goto(candidate, timeout=30000)
+                    if response and response.status == 200:
+                        quote_url = candidate
+                        break
+                except Exception:
+                    continue
+
+            if not quote_url:
+                print(f" > Could not find quote page for {ticker}, skipping.")
+                continue
+
+            # Step 2: Click the Earnings Transcripts tab and collect links
+            candidates = []
+            try:
+                # clicks "Earnings Transcripts" tab and waits for transcript links
+                page.click("text=Earnings Transcripts")
+                page.wait_for_selector("a[href*='/earnings/call-transcripts/']", timeout=15000)
+
+                soup = BeautifulSoup(page.content(), "html.parser")
+                for l in soup.find_all("a", href=True):
+                    href = l["href"]
+                    if "/earnings/call-transcripts/" not in href:
+                        continue
+                    match = pattern.search(href)
+                    if not match:
+                        continue
+                    if match.group(1).lower() != t:
+                        continue
+                    date_match = date_pattern.search(href)
+                    if not date_match:
+                        continue
+                    date_str = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+                    if (t, date_str) not in already_scored:
+                        candidates.append((t, date_str, href))
+
+            except Exception as e:
+                print(f" > Could not load transcript list for {ticker}: {e}")
+                continue
+
+            print(f"  Found {len(candidates)} unscored transcripts for {ticker}.")
+
+            # Step 3: Fetch each transcript page
+            for link_ticker, date_str, href in candidates:
+                print(f"  Fetching {link_ticker} ({date_str})...")
+                try:
+                    transcript_url = href if href.startswith("http") else "https://www.fool.com" + href
+                    page.goto(transcript_url, timeout=60000)
+                    page.wait_for_selector("div.article-body", timeout=30000)
+                    soup = BeautifulSoup(page.content(), "html.parser")
+
+                    article = soup.find("div", class_="article-body")
+                    if not article:
+                        print(f"  > No article body for {link_ticker} ({date_str}), skipping.")
+                        continue
+
+                    paragraphs = [p.get_text(strip=True) for p in article.find_all("p")]
+                    full_text = "\n".join(paragraphs)
+
+                    date_tag = soup.find("time")
+                    date = (date_tag.get("datetime") or date_tag.get_text(strip=True)) if date_tag else date_str
+
+                    results[(link_ticker, date_str)] = {
+                        "ticker": link_ticker,
+                        "url": transcript_url,
+                        "date": date,
+                        "text": full_text,
+                    }
+
+                except Exception as e:
+                    print(f"  > Error fetching {link_ticker} ({date_str}): {e}")
+
+                time.sleep(delay)
+
+        browser.close()
+
+    return results
+
 def scrape_historical_transcripts(
     n_pages: int = 40,
     delay: float = 2.0,
