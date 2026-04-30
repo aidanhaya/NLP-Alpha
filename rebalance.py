@@ -182,6 +182,10 @@ def rebalance(
 
     persistence.save_positions(positions)
 
+    spy_price = manager.get_prices(["SPY"]).get("SPY", float("nan"))
+    persistence.log_performance(str(today), portfolio_value, len(weights), spy_price)
+    print(f"Performance logged — portfolio: ${portfolio_value:,.2f}, SPY: {spy_price:.2f}")
+
 def main():
     parser = argparse.ArgumentParser(description="Rebalance portfolio using "
         "NLP-Markowitz signals.")

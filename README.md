@@ -13,7 +13,7 @@ Earnings call transcript scraper and sentiment pipeline that constructs a portfo
 5. **Optimize** — Markowitz minimum-variance weights are computed via projected gradient descent on historical return covariance.
 6. **Execute** — Market orders are placed through the IBKR paper trading API. Positions are exited on stop-loss, take-profit, time limit, or signal dropout.
 
-Scores are persisted to `transcript_scores.json` and position metadata to `positions.json` (both gitignored) so re-runs skip already-processed work.
+Scores are persisted to `transcript_scores.json` and position metadata to `positions.json` (both gitignored) so re-runs skip already-processed work. Each rebalance run appends a row to `performance_log.csv` (portfolio value, SPY benchmark price, position count) for later visualization.
 
 ---
 
@@ -58,7 +58,13 @@ python main.py
 
 ### Stage 3 — Daily run with rebalancing
 
-Runs the full pipeline and places orders through IBKR. `--portfolio-value` is the total USD value to deploy.
+Runs the full pipeline and places orders through IBKR. Portfolio value is auto-fetched from IBKR (Net Liquidation Value) each run — no manual input required.
+
+```bash
+python main.py --rebalance
+```
+
+Override the portfolio value if needed:
 
 ```bash
 python main.py --rebalance --portfolio-value 100000
@@ -67,13 +73,13 @@ python main.py --rebalance --portfolio-value 100000
 **Dry run** — prints target weights without placing any orders:
 
 ```bash
-python main.py --rebalance --portfolio-value 100000 --dry-run
+python main.py --rebalance --dry-run
 ```
 
 **Risk / holding parameters** (all optional, shown with defaults):
 
 ```bash
-python main.py --rebalance --portfolio-value 100000 \
+python main.py --rebalance \
   --holding-days 63 \       # exit after this many trading days
   --stop-loss-pct 0.15 \    # exit if position drops 15% from entry
   --take-profit-pct 0.25    # exit if position gains 25% from entry
@@ -83,25 +89,33 @@ python main.py --rebalance --portfolio-value 100000 \
 
 ### Stage 4 — Standalone rebalance
 
-Runs rebalance logic directly against already-persisted scores, without re-scraping or re-scoring. Useful for testing weight changes or re-running after a connectivity issue. `--today-tickers` is the list of tickers that had new transcripts today (used to determine signal dropout exits).
+Runs rebalance logic directly against already-persisted scores, without re-scraping or re-scoring. Useful for testing weight changes or re-running after a connectivity issue. `--today-tickers` is the list of tickers that had new transcripts today (used to determine signal dropout exits). Portfolio value is auto-fetched from IBKR if omitted.
 
 ```bash
-python rebalance.py \
-  --portfolio-value 100000 \
-  --today-tickers AAPL MSFT NVDA
+python rebalance.py --today-tickers AAPL MSFT NVDA
 ```
 
 With full options:
 
 ```bash
 python rebalance.py \
-  --portfolio-value 100000 \
   --today-tickers AAPL MSFT NVDA \
+  --portfolio-value 100000 \
   --top-pct 0.2 \
   --holding-days 63 \
   --stop-loss-pct 0.15 \
   --take-profit-pct 0.25 \
   --dry-run
+```
+
+---
+
+### Visualize performance
+
+Generates a 4-panel chart (`performance_chart.png`) and prints a summary to the terminal. Requires at least 2 days of rebalance runs.
+
+```bash
+python visualize.py
 ```
 
 ---
@@ -128,3 +142,5 @@ If a held ticker re-enters the investable universe on the same day it would have
 | `transcript_scores.json` | All scored transcripts; re-runs skip keys already present |
 | `positions.json` | Current holdings with entry date and entry price |
 | `signals_output.csv` | Latest signal rankings; regenerated each run |
+| `performance_log.csv` | Daily portfolio value, SPY benchmark price, and position count; appended each rebalance run |
+| `performance_chart.png` | Output of `visualize.py`; regenerated on demand |

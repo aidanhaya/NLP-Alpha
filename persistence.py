@@ -1,9 +1,12 @@
+import csv
 import json
 import os
 from datetime import datetime
 
 SCORES_PATH = "transcript_scores.json"
 POSITIONS_PATH = "positions.json"
+PERFORMANCE_LOG_PATH = "performance_log.csv"
+_PERF_HEADERS = ["date", "portfolio_value", "num_positions", "benchmark_price"]
 
 def load_scores(path: str = SCORES_PATH) -> list:
     # first run
@@ -39,3 +42,22 @@ def load_positions(path: str = POSITIONS_PATH) -> dict:
 def save_positions(positions: dict, path: str = POSITIONS_PATH) -> None:
     with open(path, "w") as f:
         json.dump(positions, f, indent=2)
+
+def log_performance(
+    date: str,
+    portfolio_value: float,
+    num_positions: int,
+    benchmark_price: float,
+    path: str = PERFORMANCE_LOG_PATH,
+) -> None:
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_PERF_HEADERS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            "date": date,
+            "portfolio_value": portfolio_value,
+            "num_positions": num_positions,
+            "benchmark_price": benchmark_price, # using SPY as benchmark
+        })
