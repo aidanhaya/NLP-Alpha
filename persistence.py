@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 
 SCORES_PATH = "transcript_scores.json"
+POSITIONS_PATH = "positions.json"
 
 def load_scores(path: str = SCORES_PATH) -> list:
     # first run
@@ -27,3 +28,14 @@ def get_scored_keys(records: list) -> set:
     # set of tuples containing (ticker, date) per record
     # r["date"][:10] slices the date string to YYYY-MM-DD
     return {(r["ticker"], r["date"][:10]) for r in records}
+
+def load_positions(path: str = POSITIONS_PATH) -> dict:
+    # returns {ticker: {"entry_date": str, "entry_price": float}}
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r") as f:
+        return json.load(f)
+
+def save_positions(positions: dict, path: str = POSITIONS_PATH) -> None:
+    with open(path, "w") as f:
+        json.dump(positions, f, indent=2)

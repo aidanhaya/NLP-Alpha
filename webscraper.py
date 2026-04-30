@@ -6,7 +6,9 @@ from playwright.sync_api import sync_playwright
 
 LISTING_PAGES = [
     "https://www.fool.com/earnings-call-transcripts/",
-    "https://www.fool.com/earnings-call-transcripts/page/2/",
+] + [
+    f"https://www.fool.com/earnings-call-transcripts/page/{n}/"
+    for n in range(2, 9)
 ]
 
 def scrape_all_transcripts(delay: float = 2.0) -> dict:

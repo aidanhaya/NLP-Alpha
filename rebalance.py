@@ -1,5 +1,6 @@
 import argparse
 import numpy as np
+from datetime import date
 
 import persistence
 import signal_constructor as sc
@@ -59,8 +60,11 @@ def _min_variance_weights(returns) -> dict:
 
 def rebalance(
     portfolio_value: float,
-    candidate_tickers: list,
+    today_tickers: list,
     top_pct: float = 0.2,
+    holding_days: int = 63,
+    stop_loss_pct: float = 0.15,
+    take_profit_pct: float = 0.25,
     dry_run: bool = False,
 ):
     all_records = persistence.load_scores()
@@ -72,25 +76,77 @@ def rebalance(
     for record in all_records:
         signal.add_score(record)
 
-    investable = signal.get_investable_universe(candidate_tickers, top_pct=top_pct)
-    print(f"Investable universe ({len(investable)} tickers): {investable}")
+    positions = persistence.load_positions()
+    manager = IBKRPortfolioManager()
+    today = date.today()
 
-    if not investable:
-        print("No investable tickers found.")
+    # fetch current prices for all held tickers (needed for stop-loss / take-profit checks)
+    current_prices = manager.get_prices(list(positions)) if positions else {}
+
+    # top 20% of today's newly scored tickers
+    today_investable = set(signal.get_investable_universe(today_tickers, top_pct=top_pct))
+
+    # --- identify exits ---
+    exits = set()
+    for ticker, meta in positions.items():
+        entry_date = date.fromisoformat(meta["entry_date"])
+        # counts business days since entry
+        trading_days_held = int(np.busday_count(entry_date, today))
+        price_now = current_prices.get(ticker)
+        entry_price = meta["entry_price"]
+
+        if price_now and price_now < entry_price * (1 - stop_loss_pct):
+            print(f"STOP-LOSS: {ticker} (entry {entry_price:.2f}, now {price_now:.2f})")
+            exits.add(ticker)
+            continue
+
+        if price_now and price_now > entry_price * (1 + take_profit_pct):
+            print(f"TAKE-PROFIT: {ticker} (entry {entry_price:.2f}, now {price_now:.2f})")
+            exits.add(ticker)
+            continue
+
+        if trading_days_held >= holding_days:
+            print(f"TIME-LIMIT: {ticker} ({trading_days_held} trading days held)")
+            exits.add(ticker)
+            continue
+
+        if ticker in today_tickers and ticker not in today_investable:
+            print(f"RE-EVAL EXIT: {ticker} (new earnings signal below top {int(top_pct*100)}%)")
+            exits.add(ticker)
+
+    # --- reset clock for held stocks with a new good earnings signal ---
+    for ticker in list(positions):
+        if ticker in today_tickers and ticker in today_investable and ticker not in exits:
+            old_date = positions[ticker]["entry_date"]
+            positions[ticker]["entry_date"] = str(today)
+            positions[ticker]["entry_price"] = current_prices.get(
+                ticker, positions[ticker]["entry_price"]
+            )
+            print(f"CLOCK RESET: {ticker} (re-entered top {int(top_pct*100)}%, entry date {old_date} → {today})")
+
+    # --- identify new entries ---
+    new_entries = [t for t in today_investable if t not in positions]
+    if new_entries:
+        print(f"NEW ENTRIES: {new_entries}")
+
+    # --- build active portfolio ---
+    active = [t for t in positions if t not in exits] + new_entries
+    if not active:
+        print("No active tickers for portfolio.")
         return
 
-    manager = IBKRPortfolioManager()
+    print(f"\nActive portfolio ({len(active)} tickers): {active}")
 
-    prices = manager.get_historical_prices(investable)
-    prices = prices.dropna(axis=1, how="all") # drops columns where all values are NaN
-    returns = prices.pct_change().dropna() # converts raw prices to daily % returns
+    prices_hist = manager.get_historical_prices(active)
+    prices_hist = prices_hist.dropna(axis=1, how="all")
+    returns = prices_hist.pct_change().dropna()
 
-    valid = [t for t in investable if t in returns.columns]
+    valid = [t for t in active if t in returns.columns]
     if not valid:
         print("No valid price data returned by IBKR.")
         return
-    if len(valid) < len(investable):
-        dropped = set(investable) - set(valid)
+    if len(valid) < len(active):
+        dropped = set(active) - set(valid)
         print(f"Dropped {len(dropped)} tickers with no price data: {sorted(dropped)}")
     returns = returns[valid]
 
@@ -107,6 +163,21 @@ def rebalance(
     manager.rebalance(weights, portfolio_value)
     print("Rebalance complete.")
 
+    # --- update positions.json ---
+    for ticker in exits:
+        positions.pop(ticker, None)
+
+    # fetch entry prices for new positions using current market prices
+    new_entry_prices = manager.get_prices(new_entries) if new_entries else {}
+    for ticker in new_entries:
+        if ticker in valid:  # only record positions we actually have price data for
+            positions[ticker] = {
+                "entry_date": str(today),
+                "entry_price": new_entry_prices.get(ticker, 0.0),
+            }
+
+    persistence.save_positions(positions)
+
 def main():
     parser = argparse.ArgumentParser(description="Rebalance portfolio using "
         "NLP-Markowitz signals.")
@@ -115,12 +186,24 @@ def main():
         help="Total portfolio value in USD",
     )
     parser.add_argument(
-        "--candidate-tickers", nargs="+", required=True,
-        help="Tickers to rank (today's scored tickers + current holdings)",
+        "--today-tickers", nargs="+", required=True,
+        help="Tickers with new transcripts today (passed automatically by main.py)",
     )
     parser.add_argument(
         "--top-pct", type=float, default=0.2,
-        help="Top percentile of sentiment universe to invest in (default: 0.2)",
+        help="Top percentile of today's tickers to enter (default: 0.2)",
+    )
+    parser.add_argument(
+        "--holding-days", type=int, default=63,
+        help="Max trading days to hold a position (default: 63)",
+    )
+    parser.add_argument(
+        "--stop-loss-pct", type=float, default=0.15,
+        help="Exit if position falls this fraction from entry price (default: 0.15)",
+    )
+    parser.add_argument(
+        "--take-profit-pct", type=float, default=0.25,
+        help="Exit if position gains this fraction from entry price (default: 0.25)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -130,8 +213,11 @@ def main():
 
     rebalance(
         portfolio_value=args.portfolio_value,
-        candidate_tickers=args.candidate_tickers,
+        today_tickers=args.today_tickers,
         top_pct=args.top_pct,
+        holding_days=args.holding_days,
+        stop_loss_pct=args.stop_loss_pct,
+        take_profit_pct=args.take_profit_pct,
         dry_run=args.dry_run,
     )
 
