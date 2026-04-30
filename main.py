@@ -38,7 +38,7 @@ def main():
     parser.add_argument("--rebalance", action="store_true",
                         help="Rebalance IBKR portfolio after scoring (daily mode only)")
     parser.add_argument("--portfolio-value", type=float, default=None,
-                        help="Total portfolio value in USD (required with --rebalance)")
+                        help="Total portfolio value in USD (default: auto-fetched from IBKR)")
     parser.add_argument("--holding-days", type=int, default=63,
                         help="Max trading days to hold a position (default: 63)")
     parser.add_argument("--stop-loss-pct", type=float, default=0.15,
@@ -48,9 +48,6 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="With --rebalance: print target weights without placing orders")
     args = parser.parse_args()
-
-    if args.rebalance and args.portfolio_value is None:
-        parser.error("--portfolio-value is required when using --rebalance")
 
     # loads previously saved scores from disk
     all_records = persistence.load_scores()

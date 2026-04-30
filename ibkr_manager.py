@@ -47,6 +47,13 @@ class IBKRPortfolioManager:
                 series[ticker] = {bar.date: bar.close for bar in bars}
         return pd.DataFrame(series)
 
+    def get_net_liquidation(self) -> float:
+        account_values = self.ib.accountValues()
+        for av in account_values:
+            if av.tag == "NetLiquidation" and av.currency == "USD":
+                return float(av.value)
+        raise RuntimeError("Could not retrieve NetLiquidation from IBKR account data.")
+
     def rebalance(self, target_weights: dict, portfolio_value: float):
         # target_weights: {ticker: weight} summing to 1
 

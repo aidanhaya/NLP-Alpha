@@ -80,6 +80,10 @@ def rebalance(
     manager = IBKRPortfolioManager()
     today = date.today()
 
+    if portfolio_value is None:
+        portfolio_value = manager.get_net_liquidation()
+        print(f"Portfolio value (from IBKR): ${portfolio_value:,.2f}")
+
     # fetch current prices for all held tickers (needed for stop-loss / take-profit checks)
     current_prices = manager.get_prices(list(positions)) if positions else {}
 
@@ -182,8 +186,8 @@ def main():
     parser = argparse.ArgumentParser(description="Rebalance portfolio using "
         "NLP-Markowitz signals.")
     parser.add_argument(
-        "--portfolio-value", type=float, required=True,
-        help="Total portfolio value in USD",
+        "--portfolio-value", type=float, default=None,
+        help="Total portfolio value in USD (default: auto-fetched from IBKR)",
     )
     parser.add_argument(
         "--today-tickers", nargs="+", required=True,
