@@ -59,7 +59,7 @@ def _min_variance_weights(returns) -> dict:
 
 def rebalance(
     portfolio_value: float,
-    tickers: list = None,
+    candidate_tickers: list,
     top_pct: float = 0.2,
     dry_run: bool = False,
 ):
@@ -72,10 +72,7 @@ def rebalance(
     for record in all_records:
         signal.add_score(record)
 
-    if tickers is None:
-        tickers = list({r["ticker"] for r in all_records})
-
-    investable = signal.get_investable_universe(tickers, top_pct=top_pct)
+    investable = signal.get_investable_universe(candidate_tickers, top_pct=top_pct)
     print(f"Investable universe ({len(investable)} tickers): {investable}")
 
     if not investable:
@@ -118,8 +115,8 @@ def main():
         help="Total portfolio value in USD",
     )
     parser.add_argument(
-        "--tickers", nargs="+", default=None,
-        help="Explicit ticker list to consider (defaults to all scored tickers)",
+        "--candidate-tickers", nargs="+", required=True,
+        help="Tickers to rank (today's scored tickers + current holdings)",
     )
     parser.add_argument(
         "--top-pct", type=float, default=0.2,
@@ -133,7 +130,7 @@ def main():
 
     rebalance(
         portfolio_value=args.portfolio_value,
-        tickers=args.tickers,
+        candidate_tickers=args.candidate_tickers,
         top_pct=args.top_pct,
         dry_run=args.dry_run,
     )

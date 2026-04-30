@@ -50,11 +50,24 @@ class IBKRPortfolioManager:
     def rebalance(self, target_weights: dict, portfolio_value: float):
         # target_weights: {ticker: weight} summing to 1
 
-        # fetches current prices and positions
-        prices = self.get_prices(list(target_weights.keys()))
         current_positions = self.get_current_positions()
 
+        # fetch prices for target tickers plus any held tickers being exited
+        # combined set of all desired and currently held position
+        all_tickers = list(set(target_weights.keys()) | set(current_positions.keys()))
+        prices = self.get_prices(all_tickers)
+
         orders = []
+
+        # close out positions not in the new target universe
+        for ticker, shares in current_positions.items():
+            if ticker not in target_weights and shares != 0:
+                order = MarketOrder("SELL", abs(shares))
+                contract = Stock(ticker, "SMART", "USD")
+                orders.append((contract, order))
+                print(f"EXIT {abs(shares)} shares of {ticker} (no longer investable)")
+
+        # adjust positions for target tickers
         for ticker, weight in target_weights.items():
             target_value = portfolio_value * weight
             price = prices.get(ticker)

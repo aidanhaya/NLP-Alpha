@@ -7,6 +7,8 @@ import preprocessing as pp
 import sentiment_scoring as scr
 import signal_constructor as sc
 import persistence
+import rebalance as reb
+from ibkr_manager import IBKRPortfolioManager
 
 # helper to run a single transcript through the processing pipeline
 def _run_pipeline(data: dict, ticker: str, date: str, scorer: scr.FinBERTScorer) -> dict:
@@ -34,7 +36,16 @@ def main():
                         help="Scrape historical transcripts across many pages")
     parser.add_argument("--pages", type=int, default=40,
                         help="Number of listing pages to scrape in bootstrap mode (default: 40)")
+    parser.add_argument("--rebalance", action="store_true",
+                        help="Rebalance IBKR portfolio after scoring (daily mode only)")
+    parser.add_argument("--portfolio-value", type=float, default=None,
+                        help="Total portfolio value in USD (required with --rebalance)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --rebalance: print target weights without placing orders")
     args = parser.parse_args()
+
+    if args.rebalance and args.portfolio_value is None:
+        parser.error("--portfolio-value is required when using --rebalance")
 
     # loads previously saved scores from disk
     all_records = persistence.load_scores()
@@ -122,8 +133,30 @@ def main():
     print(df.round(4).to_string(index=False))
     df.to_csv("signals_output.csv", index=False)
 
-    investable = signal.get_investable_universe(tickers)
+    if args.bootstrap:
+        candidate_tickers = tickers
+    else:
+        # union of today's transcripts and currently held positions so that
+        # existing holdings are re-evaluated and exited if they drop out of
+        # the top 20%
+        try:
+            manager = IBKRPortfolioManager()
+            held = set(manager.get_current_positions().keys())
+        except Exception as e:
+            print(f"Could not fetch IBKR positions (skipping held tickers): {e}")
+            held = set()
+        candidate_tickers = list(set(tickers) | held)
+
+    investable = signal.get_investable_universe(candidate_tickers)
     print(f"\nTop 20% investable universe ({len(investable)} tickers): {investable}")
+
+    if args.rebalance and not args.bootstrap:
+        print("\nRebalancing portfolio...")
+        reb.rebalance(
+            portfolio_value=args.portfolio_value,
+            candidate_tickers=candidate_tickers,
+            dry_run=args.dry_run,
+        )
 
 if __name__ == "__main__":
     main()
