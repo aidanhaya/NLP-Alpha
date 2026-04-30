@@ -108,8 +108,11 @@ def main():
     for record in all_records:
         signal.add_score(record)
 
-    # deduplicated list of tickers (extract tickers -> set -> list)
-    tickers = list({r["ticker"] for r in all_records})
+    # in daily mode, rank only tickers with transcripts today; in bootstrap, rank everything
+    if args.bootstrap:
+        tickers = list({r["ticker"] for r in all_records})
+    else:
+        tickers = list(raw.keys())
     if not tickers:
         print("No scored transcripts found. Run with --bootstrap first.")
         return
