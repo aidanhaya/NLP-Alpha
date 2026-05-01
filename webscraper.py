@@ -8,7 +8,7 @@ LISTING_PAGES = [
     "https://www.fool.com/earnings-call-transcripts/",
 ] + [
     f"https://www.fool.com/earnings-call-transcripts/page/{n}/"
-    for n in range(2, 9)
+    for n in range(2, 6) # ~ 5 pages mid-day // at end of day ~ 8 pages (2, 9)
 ]
 
 def scrape_all_transcripts(delay: float = 2.0) -> dict:
@@ -34,9 +34,15 @@ def scrape_all_transcripts(delay: float = 2.0) -> dict:
         ticker_href_pairs = []
 
         for listing_url in LISTING_PAGES:
-            page.goto(listing_url, timeout=60000)
-            page.wait_for_selector("a[href*='/earnings/call-transcripts/']", timeout=30000)
+            try:
+                page.goto(listing_url, timeout=90000)
+                page.wait_for_selector("a[href*='/earnings/call-transcripts/']", timeout=30000)
+            except Exception as e:
+                print(f" > Could not load {listing_url}: {e}")
+                time.sleep(delay)
+                continue
             soup = BeautifulSoup(page.content(), "html.parser")
+            time.sleep(delay)
 
             for l in soup.find_all("a", href=True):
                 href = l["href"]
