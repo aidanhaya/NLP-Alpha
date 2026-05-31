@@ -5,8 +5,6 @@ expectancy AFTER a flat 40bps round-trip cost, validated out-of-sample.
 
 Cheap and re-runnable (no scoring / no API). Reads backtest_trades.csv, writes
 backtest_summary.csv + backtest_figure.png, prints a GO / MARGINAL / KILL verdict.
-
-    python backtest_analyze.py
 """
 
 import sys
@@ -15,6 +13,7 @@ from itertools import product
 import numpy as np
 import pandas as pd
 import matplotlib
+# prevents matplotlib from popping up a display upon graph generation
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -26,8 +25,8 @@ FIGURE_PATH = "backtest_figure.png"
 COST_BPS = 40.0                 # flat round-trip, subtracted once per trade
 COST_FRAC = COST_BPS / 1e4
 Z_DEFS = ["level_z", "drift_z", "signal_blend"]
-MODES = ["fade", "momentum"]    # fade = primary hypothesis; momentum = flipped sign
-THRESHOLDS = [1.0, 1.5, 2.0, 2.5, 3.0]
+MODES = ["fade", "momentum"]    # fade = pos sent => short; momentum = pos sent => long
+THRESHOLDS = [1.0, 1.5, 2.0, 2.5, 3.0] # tested z-score cutoffs
 HORIZONS = ["ret_open+30m", "ret_open+60m", "ret_open+120m", "ret_close", "ret_t1_close"]
 TIMINGS = ["ALL", "AMC", "BMO"]
 TRAIN_FRAC = 8 / 12             # first 8 of 12 months = train, last 4 = test
@@ -35,7 +34,8 @@ MIN_N = 30                      # in-sample cells below this are flagged untrust
 MIN_N_TEST = 15                 # test slice is ~1/3 of train; confirm at a lower bar
 
 
-# ----------------------------- trade selection --------------------------- #
+# --- trade selection ---
+
 def signed_net(df: pd.DataFrame, z_def: str, mode: str, thr: float, horizon: str) -> pd.Series:
     """
     Return a Series of NET per-trade returns for triggered trades, signed by direction
@@ -96,7 +96,8 @@ def sweep(df: pd.DataFrame, dates: pd.Series) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ----------------------------- figure ------------------------------------ #
+# --- figure ---
+
 def make_figure(df_all, dates_all, df_train, df_test, best, path=FIGURE_PATH):
     sns.set_theme(style="darkgrid", palette="muted")
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -161,7 +162,8 @@ def make_figure(df_all, dates_all, df_train, df_test, best, path=FIGURE_PATH):
     print(f"Figure → {path}")
 
 
-# ----------------------------- verdict ----------------------------------- #
+# --- verdict ---
+
 def pick_best(train_summary: pd.DataFrame) -> dict | None:
     cand = train_summary[(train_summary["n"] >= MIN_N) & (train_summary["timing"] != "BMO")]
     if cand.empty:

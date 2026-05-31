@@ -81,7 +81,12 @@ class FMPClient:
         """
         out, seen = [], set()
         for page in range(max_pages):
-            rows = self._get("earning-call-transcript-latest", page=page, limit=page_size)
+            try:
+                rows = self._get("earning-call-transcript-latest", page=page, limit=page_size)
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 400:
+                    break  # hit FMP's page cap — treat as end of results
+                raise  # re-raise anything else (401, 500, etc.)
             if not rows:
                 break
             page_min_date = None
@@ -143,9 +148,9 @@ class FMPClient:
             "content": content or "",
         }
 
-    # ------------------------------------------------------------------ #
-    # Point-in-time market cap
-    # ------------------------------------------------------------------ #
+
+    # --- point-in-time market cap ---
+
     def historical_market_cap(self, symbol: str,
                               start: date = None, end: date = None) -> list[tuple[date, float]]:
         """Sorted [(date, marketCap), ...] ascending. One call covers the lookup series."""
@@ -164,9 +169,8 @@ class FMPClient:
         series.sort(key=lambda x: x[0])
         return series
 
-    # ------------------------------------------------------------------ #
-    # Intraday bars
-    # ------------------------------------------------------------------ #
+    # --- intraday bars ---
+
     def intraday_bars(self, symbol: str, interval: str,
                       start: date, end: date) -> list[dict]:
         """
@@ -192,9 +196,8 @@ class FMPClient:
         return bars
 
 
-# ---------------------------------------------------------------------- #
-# Normalization helpers (defensive — FMP shapes drift between tiers)
-# ---------------------------------------------------------------------- #
+# --- normalization helpers ---
+
 def _to_float(v, default=None):
     try:
         return float(v)
