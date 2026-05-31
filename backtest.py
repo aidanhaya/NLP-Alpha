@@ -24,15 +24,17 @@ import json
 import os
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, time, timedelta
-
 import numpy as np
+from tqdm import tqdm
 
 import preprocessing as pp          # reused: split_transcript, sentence_tokenize
 import signal_constructor as sc     # reused: SentimentSignal (point-in-time drift/z)
+import sentiment_scoring as scr     # reused: avoids importing torch unless we score
 from fmp_client import FMPClient
 
-# ----------------------------- config ----------------------------------- #
-RUN_TIME_ET = time(22, 0)           # nightly run; entry = next session open after this
+# --- config ---
+
+RUN_TIME_ET = time(22, 0)
 MIN_MARKET_CAP = 500_000_000        # point-in-time universe filter
 MIN_PRIOR_TRANSCRIPTS = 4           # need a stable z baseline before trading a name
 MAX_PRIOR_TRANSCRIPTS = 12          # cap priors used (bounds scoring; ~3yr quarterly)
@@ -94,7 +96,8 @@ def _r(v, nd=4):
     return None if v is None or (isinstance(v, float) and np.isnan(v)) else round(float(v), nd)
 
 
-# ----------------------------- scoring cache ----------------------------- #
+# --- scoring cache ---
+
 def load_score_cache(path=SCORE_CACHE_PATH) -> dict:
     if os.path.exists(path):
         with open(path) as f:
@@ -105,17 +108,6 @@ def load_score_cache(path=SCORE_CACHE_PATH) -> dict:
 def save_score_cache(cache: dict, path=SCORE_CACHE_PATH):
     with open(path, "w") as f:
         json.dump(cache, f)
-
-
-def _clean_fmp_text(text: str) -> str:
-    """
-    Light cleaning for FMP transcript content. Unlike preprocessing.clean_text
-    (which strips Motley-Fool credit lines / 'Name -- Title' speaker labels and would
-    mis-chop FMP's single-string content), we only normalize whitespace. Short speaker
-    labels are dropped downstream by sentence_tokenize's >4-word filter.
-    """
-    import re
-    return re.sub(r"\s+", " ", text or "").strip()
 
 
 def composite_for(client, scorer, cache, symbol, year, quarter) -> float | None:
@@ -129,16 +121,16 @@ def composite_for(client, scorer, cache, symbol, year, quarter) -> float | None:
         return None
     split = pp.split_transcript(t["content"])
     tokenized = {
-        "prepared": pp.sentence_tokenize(_clean_fmp_text(split["prepared"])),
-        "qa": pp.sentence_tokenize(_clean_fmp_text(split["qa"])),
+        "prepared": pp.sentence_tokenize(pp.clean_fmp_text(split["prepared"])),
+        "qa": pp.sentence_tokenize(pp.clean_fmp_text(split["qa"])),
     }
-    import sentiment_scoring as scr   # lazy: avoids importing torch unless we score
     scored = scr.score_transcript(tokenized, symbol, str(year), scorer)
     cache[key] = scored["composite"]
     return scored["composite"]
 
 
-# ----------------------------- triggers --------------------------------- #
+# --- triggers ---
+
 def point_in_time_z(prior_composites: list[float], current: float) -> float:
     """Level z-score of current composite vs PRIOR composites (priors only, no leak)."""
     if len(prior_composites) < 2:
@@ -157,7 +149,8 @@ def drift_and_signal(records_through_i: list[dict]) -> tuple[float, float]:
     return float(out.get("drift", 0.0)), float(out.get("signal", 0.0))
 
 
-# ----------------------------- entry timing ------------------------------ #
+# --- entry timing ---
+
 def classify_report_timing(dt: datetime) -> str:
     """AMC if reported at/after 16:00 ET, BMO if at/before 09:30 ET, else 'during'."""
     if dt is None:
@@ -197,7 +190,7 @@ def price_trade(client, symbol, transcript_dt, interval=INTERVAL):
     nightly decision time. Gross returns are LONG-signed; direction/cost applied later.
     """
     dec = decision_datetime(transcript_dt)
-    # search up to ~7 calendar days for the next session that actually has bars
+    # search up to 9 calendar days for the next session that actually has bars
     win_start = dec.date()
     win_end = dec.date() + timedelta(days=9)
     bars = client.intraday_bars(symbol, interval, win_start, win_end)
@@ -253,7 +246,8 @@ def mcap_at(series: list[tuple[date, float]], d: date) -> float | None:
     return val
 
 
-# ----------------------------- main loop --------------------------------- #
+# --- main loop ---
+
 def run(months: int, max_tickers: int | None):
     client = FMPClient()
     end = date.today()
@@ -261,7 +255,7 @@ def run(months: int, max_tickers: int | None):
     # priors need history well before the window:
     prior_lookback_start = start - timedelta(days=365 * 4)
 
-    print(f"Enumerating transcripts {start} → {end} ...")
+    print(f"Enumerating transcripts {start} -> {end} ...")
     window = client.list_transcripts_in_window(start, end)
     by_symbol: dict[str, list] = {}
     for w in window:
@@ -272,31 +266,29 @@ def run(months: int, max_tickers: int | None):
     print(f"{len(window)} window transcripts across {len(by_symbol)} symbols; "
           f"processing {len(symbols)}.")
 
-    import sentiment_scoring as scr
     scorer = scr.FinBERTScorer()
     cache = load_score_cache()
     candidates: list[Candidate] = []
     skips = {"mcap": 0, "priors": 0, "no_bars": 0, "no_composite": 0}
 
-    for n, symbol in enumerate(symbols, 1):
-        print(f"[{n}/{len(symbols)}] {symbol}")
+    for n, symbol in enumerate(tqdm(symbols, desc="tickers", unit="sym"), 1):
         try:
             all_dates = client.transcript_dates(symbol)            # full history
             mc_series = client.historical_market_cap(symbol, prior_lookback_start, end)
         except Exception as e:
-            print(f"  > metadata error: {e}")
+            tqdm.write(f"  > metadata error {symbol}: {e}")
             continue
 
         window_keys = {(w["year"], w["quarter"]): w for w in by_symbol[symbol]}
         history: list[dict] = []   # chronological scored {ticker,date,composite}
 
-        for rec in all_dates:      # oldest → newest
+        for rec in tqdm(all_dates, desc=symbol, leave=False, unit="qtr"):  # oldest -> newest
             yr, q, tdt = rec["year"], rec["quarter"], rec["dt"]
             comp = None
             try:
                 comp = composite_for(client, scorer, cache, symbol, yr, q)
             except Exception as e:
-                print(f"  > score error {symbol} {yr}Q{q}: {e}")
+                tqdm.write(f"  > score error {symbol} {yr}Q{q}: {e}")
             if comp is None:
                 continue
             ddate = (tdt.date() if tdt else date(yr, 1, 1))
@@ -322,7 +314,7 @@ def run(months: int, max_tickers: int | None):
             try:
                 priced = price_trade(client, symbol, w["dt"])
             except Exception as e:
-                print(f"  > price error {symbol}: {e}")
+                tqdm.write(f"  > price error {symbol}: {e}")
                 priced = None
             if priced is None:
                 skips["no_bars"] += 1
@@ -350,7 +342,7 @@ def run(months: int, max_tickers: int | None):
         for c in candidates:
             wr.writerow(c.row())
 
-    print(f"\nWrote {len(candidates)} candidates → {TRADES_PATH}")
+    print(f"\nWrote {len(candidates)} candidates -> {TRADES_PATH}")
     print(f"Skipped: {skips}")
     print("Next: python backtest_analyze.py")
 
