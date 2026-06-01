@@ -12,17 +12,37 @@ It does NOT apply thresholds, direction, or cost — those are cheap and live in
 backtest_analyze.py, so you can sweep them without re-scoring. Output: backtest_trades.csv,
 one row per priced candidate.
 
+PERFORMANCE NOTES (this revision):
+  * The run is I/O-bound on FMP, not compute-bound. Symbols are processed CONCURRENTLY
+    across a thread pool; the GPU/scorer is serialized with a lock (scoring isn't the
+    bottleneck). Point-in-time ordering is preserved because each symbol's transcript
+    sequence is handled start-to-finish inside a single worker — we parallelize ACROSS
+    symbols, never WITHIN one.
+  * Symbols that never clear MIN_MARKET_CAP anywhere in the window are skipped wholesale
+    BEFORE any transcript is fetched or scored (they can never emit a candidate).
+  * Both composites and priced trades are cached on disk, and backtest_trades.csv is
+    checkpointed periodically — so an interrupt costs minutes, not the whole run.
+
+  >>> REQUIRED companion edit in fmp_client.py <<<
+  Bump the HTTPAdapter pool so concurrent workers don't serialize on connections:
+      s.mount("https://", HTTPAdapter(max_retries=retry,
+                                      pool_connections=16, pool_maxsize=16))
+  Set pool_maxsize >= --workers, or the concurrency below buys you almost nothing.
+
 Run:
     export FMP_API_KEY=...
-    python backtest.py --months 12                 # full run
-    python backtest.py --months 12 --max-tickers 50  # pilot
+    python backtest.py --months 12                      # full run
+    python backtest.py --months 12 --max-tickers 50     # pilot
+    python backtest.py --months 12 --workers 16         # tune concurrency
 """
 
 import argparse
 import csv
 import json
 import os
-from dataclasses import dataclass, asdict
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 import numpy as np
 from tqdm import tqdm
@@ -40,7 +60,11 @@ MIN_PRIOR_TRANSCRIPTS = 4           # need a stable z baseline before trading a 
 MAX_PRIOR_TRANSCRIPTS = 12          # cap priors used (bounds scoring; ~3yr quarterly)
 INTERVAL = "1min"
 SCORE_CACHE_PATH = "backtest_scores.json"   # {f"{SYM}:{year}:{q}": composite}
+PRICE_CACHE_PATH = "backtest_prices.json"   # {f"{SYM}:{year}:{q}": {entry_date,entry_price,rets} | null}
 TRADES_PATH = "backtest_trades.csv"
+
+DEFAULT_WORKERS = 12                 # FMP Ultimate ~3000 req/min; 12 leaves headroom
+CHECKPOINT_EVERY = 25                # flush caches + trades CSV every N completed symbols
 
 # exit horizons measured from the 09:30 ET open (minutes), plus session-relative exits
 HORIZON_MINUTES = {"open+30m": 30, "open+60m": 60, "open+120m": 120}
@@ -54,6 +78,15 @@ TRADE_FIELDS = [
     "ret_open+30m", "ret_open+60m", "ret_open+120m",
     "ret_close", "ret_t1_close",
 ]
+
+# --- concurrency locks ---
+# cache_lock        : guards the shared score-cache dict (workers write distinct keys,
+#                     but the lock protects dict structure + safe json.dump snapshots)
+# price_cache_lock  : same, for the price cache
+# scorer_lock       : serializes the (GPU) FinBERT forward pass across workers
+_cache_lock = threading.Lock()
+_price_cache_lock = threading.Lock()
+_scorer_lock = threading.Lock()
 
 
 @dataclass
@@ -96,7 +129,7 @@ def _r(v, nd=4):
     return None if v is None or (isinstance(v, float) and np.isnan(v)) else round(float(v), nd)
 
 
-# --- scoring cache ---
+# --- caches ---
 
 def load_score_cache(path=SCORE_CACHE_PATH) -> dict:
     if os.path.exists(path):
@@ -110,23 +143,48 @@ def save_score_cache(cache: dict, path=SCORE_CACHE_PATH):
         json.dump(cache, f)
 
 
+def load_price_cache(path=PRICE_CACHE_PATH) -> dict:
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def save_price_cache(cache: dict, path=PRICE_CACHE_PATH):
+    with open(path, "w") as f:
+        json.dump(cache, f)
+
+
 def composite_for(client, scorer, cache, symbol, year, quarter) -> float | None:
-    """FinBERT composite for one transcript, cached. None if unavailable/empty."""
+    """FinBERT composite for one transcript, cached. None if unavailable/empty.
+
+    Network fetch runs concurrently across workers; only the GPU forward pass is
+    serialized (under _scorer_lock). A scoring EXCEPTION is not swallowed here — it
+    propagates to the caller, which decides whether to skip (and we never poison the
+    cache with a transient failure). Only a genuinely empty transcript is cached as None.
+    """
     key = f"{symbol}:{year}:{quarter}"
-    if key in cache:
-        return cache[key]
-    t = client.get_transcript(symbol, year, quarter)
+    with _cache_lock:
+        if key in cache:
+            return cache[key]
+
+    t = client.get_transcript(symbol, year, quarter)          # network — concurrent
     if not t or not t["content"]:
-        cache[key] = None
+        with _cache_lock:
+            cache[key] = None
         return None
+
     split = pp.split_transcript(t["content"])
     tokenized = {
         "prepared": pp.sentence_tokenize(pp.clean_fmp_text(split["prepared"])),
         "qa": pp.sentence_tokenize(pp.clean_fmp_text(split["qa"])),
     }
-    scored = scr.score_transcript(tokenized, symbol, str(year), scorer)
-    cache[key] = scored["composite"]
-    return scored["composite"]
+    with _scorer_lock:                                        # GPU — serialized
+        comp = scr.score_transcript(tokenized, symbol, str(year), scorer)["composite"]
+
+    with _cache_lock:
+        cache[key] = comp
+    return comp
 
 
 # --- triggers ---
@@ -235,6 +293,35 @@ def price_trade(client, symbol, transcript_dt, interval=INTERVAL):
     return entry_day, entry_price, rets
 
 
+def price_trade_cached(client, price_cache, symbol, year, quarter, transcript_dt):
+    """Cached wrapper around price_trade. Returns (entry_date_iso, entry_price, rets) or None.
+
+    A clean None return from price_trade (no bars / unpricable) IS cached, so restarts
+    skip the intraday fetch for known-bad names. A raised exception is NOT cached — it
+    propagates so the caller can treat it as a transient skip and retry next run.
+    """
+    key = f"{symbol}:{year}:{quarter}"
+    with _price_cache_lock:
+        if key in price_cache:
+            cached = price_cache[key]
+            if cached is None:
+                return None
+            return cached["entry_date"], cached["entry_price"], cached["rets"]
+
+    priced = price_trade(client, symbol, transcript_dt)        # network; may raise
+
+    if priced is None:
+        with _price_cache_lock:
+            price_cache[key] = None
+        return None
+
+    entry_day, entry_px, rets = priced
+    entry_iso = entry_day.isoformat()
+    with _price_cache_lock:
+        price_cache[key] = {"entry_date": entry_iso, "entry_price": entry_px, "rets": rets}
+    return entry_iso, entry_px, rets
+
+
 def mcap_at(series: list[tuple[date, float]], d: date) -> float | None:
     """Most recent market cap on or before date d."""
     val = None
@@ -246,9 +333,105 @@ def mcap_at(series: list[tuple[date, float]], d: date) -> float | None:
     return val
 
 
+# --- per-symbol worker (runs in a thread) ---
+
+def process_symbol(symbol, client, scorer, cache, price_cache,
+                   window_list, prior_lookback_start, end):
+    """
+    Process one symbol end-to-end and return (candidates, skips).
+
+    Pure with respect to shared mutable state: it appends to LOCAL lists/dicts and
+    returns them, so the main thread can merge single-threaded. The only shared state
+    it touches is the two caches and the scorer, each guarded by its own lock inside
+    composite_for / price_trade_cached.
+    """
+    local_candidates: list[Candidate] = []
+    skips = {"mcap": 0, "priors": 0, "no_bars": 0, "no_composite": 0}
+
+    try:
+        all_dates = client.transcript_dates(symbol)            # full history
+        mc_series = client.historical_market_cap(symbol, prior_lookback_start, end)
+    except Exception as e:
+        tqdm.write(f"  > metadata error {symbol}: {e}")
+        return local_candidates, skips
+
+    window_keys = {(w["year"], w["quarter"]): w for w in window_list}
+
+    # --- symbol gate: if NO window transcript clears the cap, this symbol can never
+    # emit a candidate, so skip scoring/fetching its entire history. ---
+    if not any((mcap_at(mc_series, w["date"]) or 0) >= MIN_MARKET_CAP
+               for w in window_keys.values()):
+        skips["mcap"] += len(window_keys)
+        return local_candidates, skips
+
+    history: list[dict] = []   # chronological scored {ticker, date, composite}
+
+    for rec in all_dates:      # oldest -> newest; order matters for point-in-time priors
+        yr, q, tdt = rec["year"], rec["quarter"], rec["dt"]
+        comp = None
+        try:
+            comp = composite_for(client, scorer, cache, symbol, yr, q)
+        except Exception as e:
+            tqdm.write(f"  > score error {symbol} {yr}Q{q}: {e}")
+        if comp is None:
+            continue
+        ddate = (tdt.date() if tdt else date(yr, 1, 1))
+        history.append({"ticker": symbol, "date": ddate.isoformat(), "composite": comp})
+
+        # only generate a trade for transcripts inside the window
+        if (yr, q) not in window_keys:
+            continue
+        w = window_keys[(yr, q)]
+        priors = [h["composite"] for h in history[:-1]][-MAX_PRIOR_TRANSCRIPTS:]
+        if len(priors) < MIN_PRIOR_TRANSCRIPTS:
+            skips["priors"] += 1
+            continue
+        mc = mcap_at(mc_series, w["date"])
+        if mc is None or mc < MIN_MARKET_CAP:
+            skips["mcap"] += 1
+            continue
+
+        lvl_z = point_in_time_z(priors, comp)
+        recs_i = history[-(MAX_PRIOR_TRANSCRIPTS + 1):]   # bounded window incl. current
+        drift_z, sig_blend = drift_and_signal(recs_i)
+
+        try:
+            priced = price_trade_cached(client, price_cache, symbol, yr, q, w["dt"])
+        except Exception as e:
+            tqdm.write(f"  > price error {symbol}: {e}")
+            priced = None
+        if priced is None:
+            skips["no_bars"] += 1
+            continue
+        entry_iso, entry_px, rets = priced
+
+        local_candidates.append(Candidate(
+            symbol=symbol, year=yr, quarter=q,
+            transcript_dt=(w["dt"].isoformat() if w["dt"] else ""),
+            report_timing=classify_report_timing(w["dt"]),
+            market_cap=mc, composite=comp, n_priors=len(priors),
+            level_z=lvl_z, drift_z=drift_z, signal_blend=sig_blend,
+            entry_date=entry_iso, entry_price=entry_px,
+            ret_30=rets["open+30m"], ret_60=rets["open+60m"], ret_120=rets["open+120m"],
+            ret_close=rets["ret_close"], ret_t1_close=rets["ret_t1_close"],
+        ))
+
+    return local_candidates, skips
+
+
+def write_trades(candidates: list[Candidate], path=TRADES_PATH):
+    """Overwrite the trades CSV from the full candidate list. Called by the main thread
+    only (during checkpoints and at the end), so no lock is needed."""
+    with open(path, "w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=TRADE_FIELDS)
+        wr.writeheader()
+        for c in candidates:
+            wr.writerow(c.row())
+
+
 # --- main loop ---
 
-def run(months: int, max_tickers: int | None):
+def run(months: int, max_tickers: int | None, workers: int):
     client = FMPClient()
     end = date.today()
     start = end - timedelta(days=int(months * 30.44))
@@ -264,83 +447,48 @@ def run(months: int, max_tickers: int | None):
     if max_tickers:
         symbols = symbols[:max_tickers]
     print(f"{len(window)} window transcripts across {len(by_symbol)} symbols; "
-          f"processing {len(symbols)}.")
+          f"processing {len(symbols)} with {workers} workers.")
 
     scorer = scr.FinBERTScorer()
     cache = load_score_cache()
+    price_cache = load_price_cache()
     candidates: list[Candidate] = []
     skips = {"mcap": 0, "priors": 0, "no_bars": 0, "no_composite": 0}
 
-    for n, symbol in enumerate(tqdm(symbols, desc="tickers", unit="sym"), 1):
-        try:
-            all_dates = client.transcript_dates(symbol)            # full history
-            mc_series = client.historical_market_cap(symbol, prior_lookback_start, end)
-        except Exception as e:
-            tqdm.write(f"  > metadata error {symbol}: {e}")
-            continue
-
-        window_keys = {(w["year"], w["quarter"]): w for w in by_symbol[symbol]}
-        history: list[dict] = []   # chronological scored {ticker,date,composite}
-
-        for rec in tqdm(all_dates, desc=symbol, leave=False, unit="qtr"):  # oldest -> newest
-            yr, q, tdt = rec["year"], rec["quarter"], rec["dt"]
-            comp = None
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(process_symbol, s, client, scorer, cache, price_cache,
+                      by_symbol[s], prior_lookback_start, end): s
+            for s in symbols
+        }
+        for fut in tqdm(as_completed(futures), total=len(futures),
+                        desc="symbols", unit="sym"):
+            s = futures[fut]
             try:
-                comp = composite_for(client, scorer, cache, symbol, yr, q)
+                cands, sk = fut.result()
             except Exception as e:
-                tqdm.write(f"  > score error {symbol} {yr}Q{q}: {e}")
-            if comp is None:
-                continue
-            ddate = (tdt.date() if tdt else date(yr, 1, 1))
-            history.append({"ticker": symbol, "date": ddate.isoformat(), "composite": comp})
-
-            # only generate a trade for transcripts inside the window
-            if (yr, q) not in window_keys:
-                continue
-            w = window_keys[(yr, q)]
-            priors = [h["composite"] for h in history[:-1]][-MAX_PRIOR_TRANSCRIPTS:]
-            if len(priors) < MIN_PRIOR_TRANSCRIPTS:
-                skips["priors"] += 1
-                continue
-            mc = mcap_at(mc_series, w["date"])
-            if mc is None or mc < MIN_MARKET_CAP:
-                skips["mcap"] += 1
+                tqdm.write(f"  > worker error {s}: {e}")
                 continue
 
-            lvl_z = point_in_time_z(priors, comp)
-            recs_i = history[-(MAX_PRIOR_TRANSCRIPTS + 1):]   # bounded window incl. current
-            drift_z, sig_blend = drift_and_signal(recs_i)
+            candidates.extend(cands)
+            for k, v in sk.items():
+                skips[k] = skips.get(k, 0) + v
 
-            try:
-                priced = price_trade(client, symbol, w["dt"])
-            except Exception as e:
-                tqdm.write(f"  > price error {symbol}: {e}")
-                priced = None
-            if priced is None:
-                skips["no_bars"] += 1
-                continue
-            entry_day, entry_px, rets = priced
+            done += 1
+            if done % CHECKPOINT_EVERY == 0:
+                with _cache_lock:
+                    save_score_cache(cache)
+                with _price_cache_lock:
+                    save_price_cache(price_cache)
+                write_trades(candidates)   # main-thread only — safe
 
-            candidates.append(Candidate(
-                symbol=symbol, year=yr, quarter=q,
-                transcript_dt=(w["dt"].isoformat() if w["dt"] else ""),
-                report_timing=classify_report_timing(w["dt"]),
-                market_cap=mc, composite=comp, n_priors=len(priors),
-                level_z=lvl_z, drift_z=drift_z, signal_blend=sig_blend,
-                entry_date=entry_day.isoformat(), entry_price=entry_px,
-                ret_30=rets["open+30m"], ret_60=rets["open+60m"], ret_120=rets["open+120m"],
-                ret_close=rets["ret_close"], ret_t1_close=rets["ret_t1_close"],
-            ))
-
-        if n % 25 == 0:
-            save_score_cache(cache)     # checkpoint
-    save_score_cache(cache)
-
-    with open(TRADES_PATH, "w", newline="") as f:
-        wr = csv.DictWriter(f, fieldnames=TRADE_FIELDS)
-        wr.writeheader()
-        for c in candidates:
-            wr.writerow(c.row())
+    # final flush
+    with _cache_lock:
+        save_score_cache(cache)
+    with _price_cache_lock:
+        save_price_cache(price_cache)
+    write_trades(candidates)
 
     print(f"\nWrote {len(candidates)} candidates -> {TRADES_PATH}")
     print(f"Skipped: {skips}")
@@ -351,8 +499,11 @@ def main():
     ap = argparse.ArgumentParser(description="Generate NLP retail-liquidity backtest candidates.")
     ap.add_argument("--months", type=int, default=12, help="Trade window length (default 12).")
     ap.add_argument("--max-tickers", type=int, default=None, help="Cap symbols (pilot runs).")
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                    help=f"Concurrent symbol workers (default {DEFAULT_WORKERS}). "
+                         f"Keep fmp_client pool_maxsize >= this value.")
     args = ap.parse_args()
-    run(args.months, args.max_tickers)
+    run(args.months, args.max_tickers, args.workers)
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ def _session() -> requests.Session:
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
     )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=16))
     return s
 
 # returns the first JSON field present (since sometimes this changes with FMP)
