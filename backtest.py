@@ -176,7 +176,7 @@ def composite_for(client, scorer, cache, symbol, year, quarter) -> float | None:
 
     split = pp.split_transcript(t["content"])
     tokenized = {
-        "prepared": pp.sentence_tokenize(pp.clean_fmp_text(split["prepared"])),
+        "prepared": pp.sentence_tokenize(pp.clean_text(split["prepared"])),
         "qa": pp.sentence_tokenize(pp.clean_fmp_text(split["qa"])),
     }
     with _scorer_lock:                                        # GPU — serialized
@@ -432,7 +432,7 @@ def write_trades(candidates: list[Candidate], path=TRADES_PATH):
 # --- main loop ---
 
 def run(months: int, max_tickers: int | None, workers: int):
-    client = FMPClient()
+    client = FMPClient(polite_delay=.15)
     end = date.today()
     start = end - timedelta(days=int(months * 30.44))
     # priors need history well before the window:
