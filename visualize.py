@@ -1,11 +1,13 @@
 import sys
 import numpy as np
 import pandas as pd
+from scipy import stats
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import seaborn as sns
 
 PERFORMANCE_LOG_PATH = "performance_log.csv"
+CAPM_MIN_OBS = 30          # below this, the beta/alpha estimate is not yet meaningful
 
 def load_and_enrich(path: str) -> pd.DataFrame:
     # read csv and convert dates to datetime objects
@@ -33,6 +35,38 @@ def load_and_enrich(path: str) -> pd.DataFrame:
 
     return df
 
+def capm_stats(df: pd.DataFrame) -> dict | None:
+    """CAPM decomposition of the strategy vs SPY from DAILY returns.
+
+    Regress portfolio daily returns on benchmark daily returns:
+        r_port = alpha + beta * r_bench + e
+    slope = beta, intercept = daily alpha. Returns beta, annualized alpha (intercept*252),
+    R², and the ALPHA p-value (two-sided t-test on the intercept, not the slope). None if
+    there are fewer than 2 aligned daily observations.
+    """
+    port = df["portfolio_value"].pct_change()
+    bench = df["benchmark_price"].pct_change()
+    aligned = pd.concat([port, bench], axis=1, keys=["port", "bench"]).dropna()
+    n = len(aligned)
+    if n < 2:
+        return None
+    reg = stats.linregress(aligned["bench"].values, aligned["port"].values)
+    daily_alpha = float(reg.intercept)
+    # alpha p-value: t = intercept / intercept_stderr against df = n-2 (linregress.pvalue
+    # is the SLOPE test, not what we want here).
+    se = float(getattr(reg, "intercept_stderr", np.nan))
+    if n > 2 and se and not np.isnan(se) and se > 0:
+        t_alpha = daily_alpha / se
+        p_alpha = float(2 * stats.t.sf(abs(t_alpha), n - 2))
+    else:
+        p_alpha = float("nan")
+    return {
+        "n": n, "beta": float(reg.slope), "daily_alpha": daily_alpha,
+        "annual_alpha_pct": daily_alpha * 252 * 100, "r2": float(reg.rvalue) ** 2,
+        "alpha_pvalue": p_alpha,
+    }
+
+
 def print_summary(df: pd.DataFrame) -> None:
     total_return = df["cumulative_return_pct"].iloc[-1]
     spy_return = (df["benchmark_price"].iloc[-1] / df["benchmark_price"].iloc[0] - 1) * 100
@@ -40,14 +74,34 @@ def print_summary(df: pd.DataFrame) -> None:
     sharpe = df["rolling_sharpe"].iloc[-1]
     days = len(df)
 
-    print(f"\n{'='*40}")
-    print(f"  Days tracked:        {days}")
-    print(f"  Strategy return:     {total_return:+.2f}%")
-    print(f"  SPY return:          {spy_return:+.2f}%")
-    print(f"  Alpha:               {total_return - spy_return:+.2f}%")
-    print(f"  Max drawdown:        {max_dd:.2f}%")
-    print(f"  Rolling Sharpe(20d): {sharpe:.2f}" if not np.isnan(sharpe) else "  Rolling Sharpe(20d): N/A (<20 days)")
-    print(f"{'='*40}\n")
+    print(f"\n{'='*48}")
+    print(f"  Days tracked:          {days}")
+    print(f"  Strategy return:       {total_return:+.2f}%")
+    print(f"  SPY return:            {spy_return:+.2f}%")
+    # NOTE: this is plain excess return, NOT alpha. Real CAPM alpha is below.
+    print(f"  Excess return vs SPY:  {total_return - spy_return:+.2f}%")
+    print(f"  Max drawdown:          {max_dd:.2f}%")
+    print(f"  Rolling Sharpe(20d):   {sharpe:.2f}" if not np.isnan(sharpe)
+          else "  Rolling Sharpe(20d):   N/A (<20 days)")
+
+    capm = capm_stats(df)
+    print(f"  {'-'*44}")
+    if capm is None:
+        print("  CAPM (beta/alpha):     N/A (need >=2 daily returns)")
+    else:
+        ap = capm["alpha_pvalue"]
+        ap_txt = f"{ap:.3f}" if not np.isnan(ap) else "N/A"
+        print(f"  CAPM vs SPY (n={capm['n']} daily returns):")
+        print(f"    Beta:                {capm['beta']:+.2f}")
+        print(f"    Alpha (annualized):  {capm['annual_alpha_pct']:+.2f}%")
+        print(f"    R^2:                 {capm['r2']:.3f}")
+        print(f"    Alpha p-value:       {ap_txt}")
+        if capm["n"] < CAPM_MIN_OBS:
+            print(f"  {'!'*44}")
+            print(f"  !! SMALL SAMPLE: only {capm['n']} daily obs (< {CAPM_MIN_OBS}). The CAPM")
+            print(f"  !! beta/alpha are NOT yet meaningful — treat as placeholders.")
+            print(f"  {'!'*44}")
+    print(f"{'='*48}\n")
 
 def plot(df: pd.DataFrame, output_path: str = "performance_chart.png") -> None:
     sns.set_theme(style="darkgrid", palette="muted")
