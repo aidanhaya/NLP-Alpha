@@ -53,7 +53,14 @@ TRADE_FIELDS = [
     "entry_date", "entry_price",
     "ret_open+30m", "ret_open+60m", "ret_open+120m",
     "ret_close", "ret_t1_close",
+    # new: retail-universe label input + per-trade market (SPY) matched returns
+    "entry_dollar_volume",
+    "spy_ret_open+30m", "spy_ret_open+60m", "spy_ret_open+120m",
+    "spy_ret_close", "spy_ret_t1_close",
 ]
+
+SPY_SYMBOL = "SPY"
+SPY_CHUNK_DAYS = 60     # FMP 1-min range cap is ~a few months/call; chunk conservatively
 
 
 @dataclass
@@ -76,6 +83,12 @@ class Candidate:
     ret_120: float
     ret_close: float
     ret_t1_close: float
+    entry_dollar_volume: float
+    spy_ret_30: float
+    spy_ret_60: float
+    spy_ret_120: float
+    spy_ret_close: float
+    spy_ret_t1_close: float
 
     def row(self) -> dict:
         return {
@@ -89,6 +102,12 @@ class Candidate:
             "ret_open+30m": _r(self.ret_30, 6), "ret_open+60m": _r(self.ret_60, 6),
             "ret_open+120m": _r(self.ret_120, 6),
             "ret_close": _r(self.ret_close, 6), "ret_t1_close": _r(self.ret_t1_close, 6),
+            "entry_dollar_volume": _r(self.entry_dollar_volume, 2),
+            "spy_ret_open+30m": _r(self.spy_ret_30, 6),
+            "spy_ret_open+60m": _r(self.spy_ret_60, 6),
+            "spy_ret_open+120m": _r(self.spy_ret_120, 6),
+            "spy_ret_close": _r(self.spy_ret_close, 6),
+            "spy_ret_t1_close": _r(self.spy_ret_t1_close, 6),
         }
 
 
@@ -186,7 +205,7 @@ def _bar_at_or_after(day_bars: list[dict], target: time) -> dict | None:
 
 def price_trade(client, symbol, transcript_dt, timing="unknown", interval=INTERVAL):
     """
-    Returns (entry_date, entry_price, gross_returns_dict) or None.
+    Returns (entry_date, entry_price, gross_returns_dict, entry_dollar_volume) or None.
     Entry session depends on report timing:
       BMO                      -> that SAME morning's 09:30 open (report landed pre-open),
       AMC / during / unknown   -> the NEXT session's 09:30 open (conservative).
@@ -220,6 +239,10 @@ def price_trade(client, symbol, transcript_dt, timing="unknown", interval=INTERV
     entry_price = entry_bar["open"]
     entry_open_dt = datetime.combine(entry_day, RTH_OPEN)
 
+    # entry-day dollar volume (proxy input for the retail-universe label): sum of
+    # close*volume over the entry session's RTH bars.
+    entry_dollar_volume = float(sum((b["close"] or 0.0) * (b["volume"] or 0.0) for b in eday))
+
     rets = {}
     for label, mins in HORIZON_MINUTES.items():
         target = (entry_open_dt + timedelta(minutes=mins)).time()
@@ -238,7 +261,65 @@ def price_trade(client, symbol, transcript_dt, timing="unknown", interval=INTERV
     else:
         rets["ret_t1_close"] = None
 
-    return entry_day, entry_price, rets
+    return entry_day, entry_price, rets, entry_dollar_volume
+
+
+# --- SPY matched-window pricing (per-trade market adjustment / beta context) ---
+
+def fetch_spy_index(client, win_start: date, win_end: date,
+                    interval=INTERVAL, chunk_days=SPY_CHUNK_DAYS) -> dict[date, list[dict]]:
+    """Fetch SPY intraday bars ONCE for the whole backtest window and return a
+    {date -> sorted RTH bars} index. Chunked to respect FMP's 1-min range cap.
+    Reuses _rth for the RTH filter so SPY is sliced exactly like the trade legs."""
+    by_date: dict[date, list[dict]] = {}
+    cur = win_start
+    while cur <= win_end:
+        chunk_end = min(cur + timedelta(days=chunk_days), win_end)
+        try:
+            bars = client.intraday_bars(SPY_SYMBOL, interval, cur, chunk_end)
+        except Exception as e:
+            print(f"  > SPY fetch error {cur}->{chunk_end}: {e} (matched returns degrade to None here)")
+            bars = []
+        for d in {b["dt"].date() for b in bars}:
+            day_bars = _rth(bars, d)
+            if day_bars:
+                by_date.setdefault(d, []).extend(day_bars)
+        cur = chunk_end + timedelta(days=1)
+    for d in by_date:
+        by_date[d].sort(key=lambda b: b["dt"])
+    return by_date
+
+
+def spy_matched_returns(spy_by_date: dict[date, list[dict]], entry_day: date) -> dict | None:
+    """SPY return over the SAME entry day and SAME horizons as the trade, priced with the
+    identical open-anchored logic used in price_trade. Returns a dict keyed by the trade's
+    horizon labels, or None if SPY bars for entry_day are missing (fail soft)."""
+    eday = spy_by_date.get(entry_day)
+    if not eday:
+        return None
+    entry_bar = _bar_at_or_after(eday, RTH_OPEN)
+    if not entry_bar or not entry_bar["open"]:
+        return None
+    entry_price = entry_bar["open"]
+    entry_open_dt = datetime.combine(entry_day, RTH_OPEN)
+
+    rets = {}
+    for label, mins in HORIZON_MINUTES.items():
+        target = (entry_open_dt + timedelta(minutes=mins)).time()
+        b = _bar_at_or_after(eday, target)
+        px = (b["close"] if b else eday[-1]["close"])   # fall back to close if past EOD
+        rets[label] = (px / entry_price - 1.0) if px else None
+
+    rets["ret_close"] = (eday[-1]["close"] / entry_price - 1.0) if eday[-1]["close"] else None
+
+    later = sorted(d for d in spy_by_date if d > entry_day)
+    t1 = next((d for d in later if spy_by_date[d]), None)
+    if t1:
+        t1bars = spy_by_date[t1]
+        rets["ret_t1_close"] = (t1bars[-1]["close"] / entry_price - 1.0) if t1bars[-1]["close"] else None
+    else:
+        rets["ret_t1_close"] = None
+    return rets
 
 
 def mcap_at(series: list[tuple[date, float]], d: date) -> float | None:
@@ -276,6 +357,15 @@ def run(months: int, max_tickers: int | None):
     cache = load_score_cache()
     candidates: list[Candidate] = []
     skips = {"mcap": 0, "priors": 0, "no_bars": 0, "no_composite": 0}
+
+    # Fetch SPY ONCE for the whole window (chunked) and index by date, so each trade's
+    # matched-window market return is priced from cache rather than a per-trade API call.
+    # Buffer covers BMO same-day entries (>= start) and AMC/T+1 exits a few days past end.
+    spy_win_start = start - timedelta(days=5)
+    spy_win_end = end + timedelta(days=14)
+    print(f"Fetching SPY 1-min bars {spy_win_start} -> {spy_win_end} (chunked) ...")
+    spy_by_date = fetch_spy_index(client, spy_win_start, spy_win_end)
+    print(f"  SPY index: {len(spy_by_date)} trading days cached.")
 
     for n, symbol in enumerate(tqdm(symbols, desc="tickers", unit="sym"), 1):
         try:
@@ -336,7 +426,10 @@ def run(months: int, max_tickers: int | None):
             if priced is None:
                 skips["no_bars"] += 1
                 continue
-            entry_day, entry_px, rets = priced
+            entry_day, entry_px, rets, edv = priced
+
+            # matched SPY return over the same entry day/horizons (fail soft -> None cols)
+            spy = spy_matched_returns(spy_by_date, entry_day) or {}
 
             candidates.append(Candidate(
                 symbol=symbol, year=yr, quarter=q,
@@ -347,6 +440,10 @@ def run(months: int, max_tickers: int | None):
                 entry_date=entry_day.isoformat(), entry_price=entry_px,
                 ret_30=rets["open+30m"], ret_60=rets["open+60m"], ret_120=rets["open+120m"],
                 ret_close=rets["ret_close"], ret_t1_close=rets["ret_t1_close"],
+                entry_dollar_volume=edv,
+                spy_ret_30=spy.get("open+30m"), spy_ret_60=spy.get("open+60m"),
+                spy_ret_120=spy.get("open+120m"),
+                spy_ret_close=spy.get("ret_close"), spy_ret_t1_close=spy.get("ret_t1_close"),
             ))
 
         if n % 25 == 0:
