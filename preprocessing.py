@@ -4,6 +4,9 @@ from nltk.tokenize import sent_tokenize
 
 nltk.download('punkt_tab', quiet=True)
 
+def clean_fmp_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
 def split_transcript(text: str) -> dict:
     # Each marker is paired with a list of exclusion phrases.
     # If any exclusion phrase surrounds the match, it's skipped.
