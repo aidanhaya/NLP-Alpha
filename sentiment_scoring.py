@@ -3,31 +3,27 @@ import torch
 import numpy as np
 
 class FinBERTScorer:
-    def __init__(self):
-        model_name = "ProsusAI/finbert" # best publicly available FinBERT
-        # downloads tokenizer and model weights from HuggingFace
+    def __init__(self, batch_size=64):
+        model_name = "ProsusAI/finbert"
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
-        self.model.eval() # puts model in evaluation (instead of training) mode
-        self.labels = ["positive", "negative", "neutral"] # defines sentiment classes
+        self.model.to(self.device).eval()
+        self.labels = ["positive", "negative", "neutral"]  # keep this order identical to yours
+        self.batch_size = batch_size
 
-    def score_sentence(self, text: str) -> dict:
-        inputs = self.tokenizer(
-            # tokenizes sentence into a pytorch tensor
-            text, return_tensors="pt",
-            # truncates text longer than 512 tokens (BERT's limit)
-            # pads shorter sentences with 0-tokens so batches are same length
-            truncation=True, max_length=512, padding=True
-        )
-        with torch.no_grad(): # doesn't track gradients
-            # projects 768-dim BERT hidden state vectors onto a 3-dim vector
-            # that 3-dim vector represents positive, negative, neutral sentiment
-            # those values are logits - unnormalized probabilities
-            logits = self.model(**inputs).logits
-        # runs softmax on logits to get normalized probabilities
-        # squeeze() removes batch dimension, converts 2-dim matrix to a numpy vector
-        probs = torch.softmax(logits, dim=1).squeeze().numpy()
-        return dict(zip(self.labels, probs)) # zips label names with their probabilities
+    @torch.inference_mode()
+    def score_sentences(self, sentences: list) -> list:
+        out = []
+        for i in range(0, len(sentences), self.batch_size):
+            batch = sentences[i:i + self.batch_size]
+            inputs = self.tokenizer(
+                batch, return_tensors="pt",
+                truncation=True, max_length=512, padding=True  # pads to longest in batch
+            ).to(self.device)
+            probs = torch.softmax(self.model(**inputs).logits, dim=1).cpu().numpy()
+            out.extend(dict(zip(self.labels, row)) for row in probs)
+        return out
 
     def score_document(self, sentences: list) -> dict:
         """
@@ -37,7 +33,7 @@ class FinBERTScorer:
         if not sentences:
             return {"score": 0.0, "positive": 0.0, "negative": 0.0, "neutral": 1.0, "n_sentences": 0}
 
-        scores = [self.score_sentence(s) for s in sentences]
+        scores = self.score_sentences(sentences)
 
         mean_pos = np.mean([s["positive"] for s in scores])
         mean_neg = np.mean([s["negative"] for s in scores])
