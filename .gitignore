@@ -3,6 +3,9 @@
 __pycache__/
 *.pyc
 *.pyo
+*.png
+*.json
+*.csv
 .env
 transcript_scores.json
 signals_output.csv
