@@ -384,6 +384,21 @@ def run(months: int, max_tickers: int | None):
             timing_map = {}
 
         window_keys = {(w["year"], w["quarter"]): w for w in by_symbol[symbol]}
+
+        # PRE-SCORING mcap gate. A symbol can only produce a trade if it clears
+        # MIN_MARKET_CAP at one of its in-window transcript dates (the same test
+        # applied per-transcript below at the `mc < MIN_MARKET_CAP` skip). If it
+        # never clears the floor, every candidate would be skipped anyway — so cut
+        # the whole symbol here, BEFORE FinBERT-scoring its full history or fetching
+        # any bars. Previously the cap was only checked after scoring, so sub-cap
+        # US names and foreign listings (e.g. *.HK/*.TO/*.L, which have no US mcap
+        # series) were fully scored and then discarded. Output is unchanged: these
+        # symbols contributed zero candidates either way.
+        if all((mcap_at(mc_series, w["date"]) or 0.0) < MIN_MARKET_CAP
+               for w in by_symbol[symbol]):
+            skips["mcap"] += len(by_symbol[symbol])
+            continue
+
         history: list[dict] = []   # chronological scored {ticker,date,composite}
 
         for rec in tqdm(all_dates, desc=symbol, leave=False, unit="qtr"):  # oldest -> newest
