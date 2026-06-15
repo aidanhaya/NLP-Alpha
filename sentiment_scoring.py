@@ -3,7 +3,7 @@ import torch
 import numpy as np
 
 class FinBERTScorer:
-    def __init__(self, batch_size=64):
+    def __init__(self, batch_size=256):
         model_name = "ProsusAI/finbert"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -11,6 +11,10 @@ class FinBERTScorer:
         self.model.to(self.device).eval()
         self.labels = ["positive", "negative", "neutral"]  # keep this order identical to yours
         self.batch_size = batch_size
+        # FinBERT is inference-only here, so run the forward pass in fp16 on GPU:
+        # ~2x throughput on tensor-core cards (e.g. RTX 4090) and frees VRAM for a
+        # bigger batch. CPU has no fp16 fast path, so gate AMP on CUDA only.
+        self.use_amp = self.device.type == "cuda"
 
     @torch.inference_mode()
     def score_sentences(self, sentences: list) -> list:
@@ -21,7 +25,11 @@ class FinBERTScorer:
                 batch, return_tensors="pt",
                 truncation=True, max_length=512, padding=True  # pads to longest in batch
             ).to(self.device)
-            probs = torch.softmax(self.model(**inputs).logits, dim=1).cpu().numpy()
+            with torch.autocast(device_type=self.device.type, dtype=torch.float16,
+                                 enabled=self.use_amp):
+                logits = self.model(**inputs).logits
+            # softmax in fp32 for numerically stable probabilities
+            probs = torch.softmax(logits.float(), dim=1).cpu().numpy()
             out.extend(dict(zip(self.labels, row)) for row in probs)
         return out
 
