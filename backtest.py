@@ -7,7 +7,7 @@ This is the EXPENSIVE, run-once step. For every in-window earnings transcript in
   2. computes three point-in-time trigger quantities (level-z, drift-z, signal blend),
   3. determines the next trading day's open as ENTRY (report time-of-day doesn't matter —
      only the calendar day the report landed on),
-  4. prices forward GROSS returns at 1 / 3 / 5 trading days using daily close prices.
+  4. prices forward GROSS returns at 30 / 90 / 180 trading days using daily close prices.
 
 It does NOT apply thresholds, direction, or cost — those are cheap and live in
 backtest_analyze.py, so you can sweep them without re-scoring. Output: backtest_trades.csv,
@@ -42,17 +42,20 @@ SCORE_CACHE_PATH = "backtest_scores.json"   # {f"{SYM}:{year}:{q}": composite}
 TRADES_PATH = "backtest_trades.csv"
 
 # forward horizons measured in trading days from the entry day
-HORIZON_DAYS = {"ret_1d": 1, "ret_3d": 3, "ret_5d": 5}
-PRICE_WINDOW_DAYS = 21      # calendar-day buffer covering the 5-trading-day horizon
+HORIZON_DAYS = {"ret_30d": 30, "ret_90d": 90, "ret_180d": 180}
+# calendar-day buffer covering the 180-trading-day horizon: ~252 calendar days span
+# 180 NYSE sessions counting weekends only, plus slack for the ~7 holidays in that
+# span and run-time edge cases.
+PRICE_WINDOW_DAYS = 290
 
 TRADE_FIELDS = [
     "symbol", "year", "quarter", "transcript_dt",
     "market_cap", "composite", "n_priors",
     "level_z", "drift_z", "signal_blend",
     "entry_date", "entry_price",
-    "ret_1d", "ret_3d", "ret_5d",
+    "ret_30d", "ret_90d", "ret_180d",
     # per-trade market (SPY) matched returns
-    "spy_ret_1d", "spy_ret_3d", "spy_ret_5d",
+    "spy_ret_30d", "spy_ret_90d", "spy_ret_180d",
 ]
 
 SPY_SYMBOL = "SPY"
@@ -72,12 +75,12 @@ class Candidate:
     signal_blend: float
     entry_date: str
     entry_price: float
-    ret_1d: float
-    ret_3d: float
-    ret_5d: float
-    spy_ret_1d: float
-    spy_ret_3d: float
-    spy_ret_5d: float
+    ret_30d: float
+    ret_90d: float
+    ret_180d: float
+    spy_ret_30d: float
+    spy_ret_90d: float
+    spy_ret_180d: float
 
     def row(self) -> dict:
         return {
@@ -88,10 +91,10 @@ class Candidate:
             "level_z": _r(self.level_z), "drift_z": _r(self.drift_z),
             "signal_blend": _r(self.signal_blend),
             "entry_date": self.entry_date, "entry_price": _r(self.entry_price, 4),
-            "ret_1d": _r(self.ret_1d, 6), "ret_3d": _r(self.ret_3d, 6),
-            "ret_5d": _r(self.ret_5d, 6),
-            "spy_ret_1d": _r(self.spy_ret_1d, 6), "spy_ret_3d": _r(self.spy_ret_3d, 6),
-            "spy_ret_5d": _r(self.spy_ret_5d, 6),
+            "ret_30d": _r(self.ret_30d, 6), "ret_90d": _r(self.ret_90d, 6),
+            "ret_180d": _r(self.ret_180d, 6),
+            "spy_ret_30d": _r(self.spy_ret_30d, 6), "spy_ret_90d": _r(self.spy_ret_90d, 6),
+            "spy_ret_180d": _r(self.spy_ret_180d, 6),
         }
 
 
@@ -253,7 +256,7 @@ def run(months: int, max_tickers: int | None):
 
     # Fetch SPY ONCE for the whole window and index by date, so each trade's matched-window
     # market return is priced from cache rather than a per-trade API call. Buffer covers
-    # entries near the window edges and the 5-trading-day exit horizon past the end.
+    # entries near the window edges and the 180-trading-day exit horizon past the end.
     spy_win_start = start - timedelta(days=5)
     spy_win_end = end + timedelta(days=PRICE_WINDOW_DAYS)
     print(f"Fetching SPY daily bars {spy_win_start} -> {spy_win_end} ...")
@@ -334,9 +337,9 @@ def run(months: int, max_tickers: int | None):
                 market_cap=mc, composite=comp, n_priors=len(priors),
                 level_z=lvl_z, drift_z=drift_z, signal_blend=sig_blend,
                 entry_date=entry_day.isoformat(), entry_price=entry_px,
-                ret_1d=rets["ret_1d"], ret_3d=rets["ret_3d"], ret_5d=rets["ret_5d"],
-                spy_ret_1d=spy.get("ret_1d"), spy_ret_3d=spy.get("ret_3d"),
-                spy_ret_5d=spy.get("ret_5d"),
+                ret_30d=rets["ret_30d"], ret_90d=rets["ret_90d"], ret_180d=rets["ret_180d"],
+                spy_ret_30d=spy.get("ret_30d"), spy_ret_90d=spy.get("ret_90d"),
+                spy_ret_180d=spy.get("ret_180d"),
             ))
 
         if n % 25 == 0:

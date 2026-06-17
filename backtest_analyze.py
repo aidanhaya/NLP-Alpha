@@ -38,7 +38,7 @@ COST_FRAC = COST_BPS / 1e4
 Z_DEFS = ["level_z", "drift_z"]
 MODES = ["fade", "momentum"]    # fade = pos sent => short; momentum = pos sent => long
 THRESHOLDS = [1.5, 2.0, 2.5]    # tested z-score cutoffs
-HORIZONS = ["ret_1d", "ret_3d", "ret_5d"]   # daily forward horizons
+HORIZONS = ["ret_30d", "ret_90d", "ret_180d"]   # forward horizons, in trading days
 #   2 (z) x 2 (mode) x 3 (thr) x 3 (horizon) = 36 cells.
 
 MIN_N = 30                      # in-sample cells below this are flagged untrustworthy
@@ -47,8 +47,10 @@ MIN_N_TEST = 15                 # pooled-OOS confirmation bar
 # --- walk-forward validation ---
 INITIAL_TRAIN_MONTHS = 12       # anchored start: first 12 months are train-only
 EMBARGO_DAYS = 2                # trading days dropped from train just before each test month
-PURGE_DAYS = 0                  # inert stub (see walk_forward): activate in Part 2 when
-                                # holding periods exceed one day and label windows overlap.
+# Horizons now reach 180 trading days, so a train trade's label window can extend well past
+# the embargo into the test month (leakage). Purge drops train trades entered within the
+# longest horizon of the embargo cutoff, sized off HORIZONS so it stays correct if those change.
+PURGE_DAYS = max(int(h.rsplit("_", 1)[-1].rstrip("d")) for h in HORIZONS)
 
 
 # --- trade selection ---
@@ -153,9 +155,8 @@ def walk_forward(df: pd.DataFrame) -> dict:
 
         train = work[work["_month"] < m_t]
         train = train[train["entry_date"] < embargo_start]   # apply the embargo
-        # PURGE (inert): once holdings exceed the 5-day horizon (Part 2), also drop train
-        # trades whose label window overlaps the embargo/test region. Horizons top out at
-        # 5 trading days now, so overlap is negligible and PURGE_DAYS == 0 leaves this a no-op.
+        # PURGE: horizons top out at 180 trading days, so also drop train trades whose label
+        # window could overlap the embargo/test region (entered within PURGE_DAYS of it).
         if PURGE_DAYS > 0:
             purge_start = embargo_start - pd.tseries.offsets.BDay(PURGE_DAYS)
             train = train[train["entry_date"] < purge_start]
@@ -206,7 +207,7 @@ def pick_best(train_summary: pd.DataFrame) -> dict | None:
 
 def make_figure(df, wf, headline_cfg, path=FIGURE_PATH):
     hc = headline_cfg or {"z_def": "level_z", "mode": "fade", "threshold": 2.0,
-                          "horizon": "ret_1d"}
+                          "horizon": "ret_30d"}
     sns.set_theme(style="darkgrid", palette="muted")
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle("NLP Earnings-Call Sentiment Backtest — net of 40bps round-trip",
@@ -225,7 +226,7 @@ def make_figure(df, wf, headline_cfg, path=FIGURE_PATH):
     ax.set_xlabel("|z| threshold"); ax.set_ylabel("net mean return (bps)")
     ax.legend(fontsize=8)
 
-    # (0,1) headline config across horizons (1d/3d/5d)
+    # (0,1) headline config across horizons (30d/90d/180d)
     ax = axes[0, 1]
     bars = []
     for horizon in HORIZONS:
