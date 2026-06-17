@@ -32,7 +32,7 @@ The backtest harness (`backtest.py` + `backtest_analyze.py`, on Financial Modeli
 
 v3 began with an uncomfortable discovery: **the v2 backtest was measuring the wrong trade.** FMP caps rows per request and returns the most recent bars first, so the single 9-day price window per candidate silently dropped its early sessions — entries landed roughly five sessions late instead of at the intended next-session open. Every return column was contaminated. That pricing bug has since been fixed directly in `backtest.py`.
 
-v3 also dropped two pieces of scope that turned out not to matter for the question being asked: the universe is no longer filtered down to a retail-liquidity subset, and entries no longer condition on whether a report landed before or after market close — only the calendar day matters now. Pricing moved from intraday bars to daily bars, with forward returns measured at 1/3/5 trading days.
+v3 also dropped two pieces of scope that turned out not to matter for the question being asked: the universe is no longer filtered down to a retail-liquidity subset, and entries no longer condition on whether a report landed before or after market close — only the calendar day matters now. Pricing moved from intraday bars to daily bars, with forward returns measured at 30/90/180 trading days.
 
 **Current plans, in order:**
 
@@ -134,7 +134,7 @@ python backtest.py --months 12            # expensive: score + price all candida
 python backtest_analyze.py                # cheap: sweep + verdict
 ```
 
-- `backtest.py` writes `backtest_trades.csv` — one row per priced candidate, with signal columns and forward gross returns at 1/3/5 trading days (daily bars; entry is always the next trading day's open after the report date). It does **not** apply thresholds, direction, or cost.
+- `backtest.py` writes `backtest_trades.csv` — one row per priced candidate, with signal columns and forward gross returns at 30/90/180 trading days (daily bars; entry is always the next trading day's open after the report date). It does **not** apply thresholds, direction, or cost.
 - `backtest_analyze.py` sweeps configurations, applies the 40 bps round-trip cost, validates train/test, writes `backtest_summary.csv` + `backtest_figure.png`, and prints the verdict.
 
 ---
