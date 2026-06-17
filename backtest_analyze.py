@@ -4,16 +4,14 @@ candidates in backtest_trades.csv and report whether any configuration shows pos
 expectancy AFTER a flat 40bps round-trip cost, validated OUT-OF-SAMPLE.
 
 Cheap and re-runnable (no scoring / no API). Reads backtest_trades.csv, writes
-backtest_summary.csv (+ backtest_summary_retail.csv) and backtest_figure.png.
+backtest_summary.csv and backtest_figure.png.
 
 Part-1 hardening vs. the original single train/test cut:
-  * Grid shrunk 450 -> 36 cells (fewer researcher degrees of freedom).
+  * Grid shrunk to 36 cells (fewer researcher degrees of freedom).
   * Validation is an expanding (anchored) walk-forward that RE-SELECTS the config each
     step, with a 2-trading-day embargo — no single config is cherry-picked with hindsight.
   * Every reported mean carries a 95% confidence interval; with small N the interval is
     the honest story.
-  * Run on BOTH the full universe (for statistical power / config-lock context) and a
-    turnover-dominant retail PROXY subset (the primary deliverable).
 """
 
 import sys
@@ -30,20 +28,18 @@ import seaborn as sns
 
 TRADES_PATH = "backtest_trades.csv"
 SUMMARY_PATH = "backtest_summary.csv"
-SUMMARY_RETAIL_PATH = "backtest_summary_retail.csv"
 FIGURE_PATH = "backtest_figure.png"
 
 COST_BPS = 40.0                 # flat round-trip, subtracted once per trade
 COST_FRAC = COST_BPS / 1e4
 
 # --- sweep grid (shrunk to 36 cells: overfit / multiple-comparisons control) ---
-# drop signal_blend (deterministic function of level_z & drift_z); fix the horizon.
+# drop signal_blend (deterministic function of level_z & drift_z).
 Z_DEFS = ["level_z", "drift_z"]
 MODES = ["fade", "momentum"]    # fade = pos sent => short; momentum = pos sent => long
 THRESHOLDS = [1.5, 2.0, 2.5]    # tested z-score cutoffs
-HORIZONS = ["ret_open+60m"]     # single fixed horizon
-TIMINGS = ["ALL", "AMC", "BMO"] # keep all three: no report-time stamps to justify dropping BMO
-#   2 (z) x 2 (mode) x 3 (thr) x 1 (horizon) x 3 (timing) = 36 cells.
+HORIZONS = ["ret_1d", "ret_3d", "ret_5d"]   # daily forward horizons
+#   2 (z) x 2 (mode) x 3 (thr) x 3 (horizon) = 36 cells.
 
 MIN_N = 30                      # in-sample cells below this are flagged untrustworthy
 MIN_N_TEST = 15                 # pooled-OOS confirmation bar
@@ -53,11 +49,6 @@ INITIAL_TRAIN_MONTHS = 12       # anchored start: first 12 months are train-only
 EMBARGO_DAYS = 2                # trading days dropped from train just before each test month
 PURGE_DAYS = 0                  # inert stub (see walk_forward): activate in Part 2 when
                                 # holding periods exceed one day and label windows overlap.
-
-# --- retail-universe proxy label ---
-RETAIL_TURNOVER_W = 0.85        # turnover-dominant (tunable starting weights)
-RETAIL_PRICE_W = 0.15
-RETAIL_QUANTILE = 0.80          # top quintile of the retail score = "retail"
 
 
 # --- trade selection ---
@@ -116,53 +107,23 @@ def cell_stats(net: pd.Series, dates: pd.Series) -> dict:
 
 def sweep(df: pd.DataFrame, dates: pd.Series) -> pd.DataFrame:
     rows = []
-    for z_def, mode, thr, horizon, timing in product(Z_DEFS, MODES, THRESHOLDS, HORIZONS, TIMINGS):
-        sub = df if timing == "ALL" else df[df["report_timing"] == timing]
-        if sub.empty:
-            continue
-        net = signed_net(sub, z_def, mode, thr, horizon)
+    for z_def, mode, thr, horizon in product(Z_DEFS, MODES, THRESHOLDS, HORIZONS):
+        net = signed_net(df, z_def, mode, thr, horizon)
         st = cell_stats(net, dates)
         if st["n"] == 0:
             continue
         rows.append({"z_def": z_def, "mode": mode, "threshold": thr,
-                     "horizon": horizon, "timing": timing, **st})
+                     "horizon": horizon, **st})
     return pd.DataFrame(rows)
 
 
 def apply_config(df: pd.DataFrame, cfg: dict) -> pd.Series:
-    """Signed-net Series for one config, honoring its timing slice (ALL = no filter)."""
-    sub = df if cfg["timing"] == "ALL" else df[df["report_timing"] == cfg["timing"]]
-    return signed_net(sub, cfg["z_def"], cfg["mode"], cfg["threshold"], cfg["horizon"])
+    """Signed-net Series for one config."""
+    return signed_net(df, cfg["z_def"], cfg["mode"], cfg["threshold"], cfg["horizon"])
 
 
 def stats_for(df: pd.DataFrame, dates: pd.Series, cfg: dict) -> dict:
     return cell_stats(apply_config(df, cfg), dates)
-
-
-# --- retail-universe proxy label ---
-
-def add_retail_label(df: pd.DataFrame) -> bool:
-    """Add a boolean `retail` column from a turnover-dominant point-in-time proxy.
-
-    turnover = entry_dollar_volume / market_cap  (both as-of the trade)
-    score    = 0.85*rank(turnover, high=retail) + 0.15*rank(1 - price, low price=retail)
-    retail   = score in the top quintile.
-
-    Returns False (and adds nothing) if entry_dollar_volume is absent/empty — i.e. the CSV
-    predates the backtest.py change; caller should tell the user to re-run backtest.py.
-
-    PROXY, not a measurement: turnover is total churn (institutional + retail) and these
-    signals also correlate with small/illiquid names. No size/liquidity control here.
-    """
-    if "entry_dollar_volume" not in df.columns or df["entry_dollar_volume"].notna().sum() == 0:
-        return False
-    turnover = df["entry_dollar_volume"] / df["market_cap"]
-    turnover_pct = turnover.rank(pct=True)               # high turnover -> retail
-    price_pct = df["entry_price"].rank(pct=True)          # low price -> retail
-    score = RETAIL_TURNOVER_W * turnover_pct + RETAIL_PRICE_W * (1 - price_pct)
-    df["retail_score"] = score
-    df["retail"] = score >= score.quantile(RETAIL_QUANTILE)
-    return True
 
 
 # --- expanding walk-forward + embargo ---
@@ -192,9 +153,9 @@ def walk_forward(df: pd.DataFrame) -> dict:
 
         train = work[work["_month"] < m_t]
         train = train[train["entry_date"] < embargo_start]   # apply the embargo
-        # PURGE (inert): once holdings exceed one day (Part 2), also drop train trades whose
-        # label window overlaps the embargo/test region. Horizons are intraday->T+1 now, so
-        # overlap is negligible and PURGE_DAYS == 0 leaves this a no-op.
+        # PURGE (inert): once holdings exceed the 5-day horizon (Part 2), also drop train
+        # trades whose label window overlaps the embargo/test region. Horizons top out at
+        # 5 trading days now, so overlap is negligible and PURGE_DAYS == 0 leaves this a no-op.
         if PURGE_DAYS > 0:
             purge_start = embargo_start - pd.tseries.offsets.BDay(PURGE_DAYS)
             train = train[train["entry_date"] < purge_start]
@@ -208,7 +169,7 @@ def walk_forward(df: pd.DataFrame) -> dict:
         if len(net):
             oos_net_parts.append(net)
             oos_date_parts.append(test["entry_date"].loc[net.index])
-        key = (best["z_def"], best["mode"], best["threshold"], best["horizon"], best["timing"])
+        key = (best["z_def"], best["mode"], best["threshold"], best["horizon"])
         config_counter[key] = config_counter.get(key, 0) + 1
         per_month.append({"month": str(m_t), "test_n": int(len(net)), "config": best})
 
@@ -225,7 +186,7 @@ def walk_forward(df: pd.DataFrame) -> dict:
     if config_counter:
         k = max(config_counter, key=config_counter.get)
         modal_config = {"z_def": k[0], "mode": k[1], "threshold": k[2], "horizon": k[3],
-                        "timing": k[4], "count": config_counter[k],
+                        "count": config_counter[k],
                         "n_selected_months": sum(1 for p in per_month if p["config"])}
 
     return {"oos_net": oos_net, "oos_dates": oos_dates, "oos_stats": oos_stats,
@@ -235,7 +196,7 @@ def walk_forward(df: pd.DataFrame) -> dict:
 def pick_best(train_summary: pd.DataFrame) -> dict | None:
     if train_summary.empty:
         return None
-    cand = train_summary[(train_summary["n"] >= MIN_N) & (train_summary["timing"] != "BMO")]
+    cand = train_summary[train_summary["n"] >= MIN_N]
     if cand.empty:
         return None
     return cand.sort_values("mean", ascending=False).iloc[0].to_dict()
@@ -245,37 +206,35 @@ def pick_best(train_summary: pd.DataFrame) -> dict | None:
 
 def make_figure(df, wf, headline_cfg, path=FIGURE_PATH):
     hc = headline_cfg or {"z_def": "level_z", "mode": "fade", "threshold": 2.0,
-                          "horizon": "ret_open+60m", "timing": "AMC"}
+                          "horizon": "ret_1d"}
     sns.set_theme(style="darkgrid", palette="muted")
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("NLP Retail-Liquidity Backtest — net of 40bps round-trip",
+    fig.suptitle("NLP Earnings-Call Sentiment Backtest — net of 40bps round-trip",
                  fontsize=14, fontweight="bold")
 
-    # (0,0) expectancy vs threshold, by z-def (fade, AMC, open+60m)
+    # (0,0) expectancy vs threshold, by z-def (fade, headline horizon)
     ax = axes[0, 0]
-    amc = df[df["report_timing"] == "AMC"]
     for z_def in Z_DEFS:
         ys = []
         for thr in THRESHOLDS:
-            net = signed_net(amc, z_def, "fade", thr, "ret_open+60m")
+            net = signed_net(df, z_def, "fade", thr, hc["horizon"])
             ys.append(net.mean() * 1e4 if len(net) else np.nan)
         ax.plot(THRESHOLDS, ys, marker="o", label=z_def)
     ax.axhline(0, color="gray", lw=0.8, ls="--")
-    ax.set_title("AMC · fade · open+60m: net mean (bps) vs z-threshold")
+    ax.set_title(f"fade · {hc['horizon']}: net mean (bps) vs z-threshold")
     ax.set_xlabel("|z| threshold"); ax.set_ylabel("net mean return (bps)")
     ax.legend(fontsize=8)
 
-    # (0,1) AMC vs BMO for the headline config (validates the 'late' premise)
+    # (0,1) headline config across horizons (1d/3d/5d)
     ax = axes[0, 1]
     bars = []
-    for timing in ["AMC", "BMO"]:
-        sub = df[df["report_timing"] == timing]
-        net = signed_net(sub, hc["z_def"], hc["mode"], hc["threshold"], hc["horizon"])
+    for horizon in HORIZONS:
+        net = signed_net(df, hc["z_def"], hc["mode"], hc["threshold"], horizon)
         bars.append(net.mean() * 1e4 if len(net) else 0.0)
-    ax.bar(["AMC", "BMO"], bars, color=["steelblue", "tomato"])
+    ax.bar(HORIZONS, bars, color="steelblue")
     ax.axhline(0, color="gray", lw=0.8, ls="--")
-    ax.set_title(f"Headline config by timing\n({hc['z_def']}·{hc['mode']}·"
-                 f"thr{hc['threshold']}·{hc['horizon']})")
+    ax.set_title(f"Headline config across horizons\n({hc['z_def']}·{hc['mode']}·"
+                 f"thr{hc['threshold']})")
     ax.set_ylabel("net mean return (bps)")
 
     # (1,0) net return distribution for the headline config (all)
@@ -371,19 +330,16 @@ def verdict_wf(label: str, wf: dict, full_best: dict | None, full_stats: dict | 
     mc = wf["modal_config"]
     if mc:
         print(f"  Modal selected config ({mc['count']}/{mc['n_selected_months']} selected months): "
-              f"{mc['z_def']} · {mc['mode']} · |z|>={mc['threshold']} · {mc['horizon']} · {mc['timing']}")
+              f"{mc['z_def']} · {mc['mode']} · |z|>={mc['threshold']} · {mc['horizon']}")
     else:
         print("  Modal selected config: none (no month selected a qualifying config).")
-
-
-
 
 
     print("  Per-month OOS counts:")
     for pm in wf["per_month"]:
         if pm["config"]:
             c = pm["config"]
-            tag = f"{c['z_def']}/{c['mode']}/|z|{c['threshold']}/{c['timing']}"
+            tag = f"{c['z_def']}/{c['mode']}/|z|{c['threshold']}/{c['horizon']}"
         else:
             tag = "— (no qualifying config; N guard)"
         print(f"    {pm['month']}: n={pm['test_n']:>3}   {tag}")
@@ -392,7 +348,7 @@ def verdict_wf(label: str, wf: dict, full_best: dict | None, full_stats: dict | 
     if full_best and full_stats and full_stats.get("n", 0) > 0:
         print("  (context only — in-sample is optimistic, NOT a trading signal)")
         print(f"    Full in-sample best: {full_best['z_def']} · {full_best['mode']} · "
-              f"|z|>={full_best['threshold']} · {full_best['horizon']} · {full_best['timing']}")
+              f"|z|>={full_best['threshold']} · {full_best['horizon']}")
         print(f"    n={full_stats['n']}  mean={_bps(full_stats['mean']):+.1f}bps  "
               f"t={full_stats['t_stat']:+.2f}  95% CI {_ci_text(full_stats)}")
     else:
@@ -433,34 +389,11 @@ def main():
     print(f"{len(df)} candidates | entry {df['entry_date'].min().date()} → "
           f"{df['entry_date'].max().date()} | {n_months} calendar months "
           f"({max(0, n_months - INITIAL_TRAIN_MONTHS)} OOS months after {INITIAL_TRAIN_MONTHS}mo train)")
-    print(f"Timing mix: {df['report_timing'].value_counts().to_dict()}")
 
-    has_retail = add_retail_label(df)
+    wf, best = run_universe(df, "FULL UNIVERSE", SUMMARY_PATH)
 
-    # FULL UNIVERSE — kept for statistical power / config-lock context.
-    wf_full, best_full = run_universe(df, "FULL UNIVERSE (power / config-lock context)",
-                                      SUMMARY_PATH)
-
-    # RETAIL SUBSET — the primary deliverable.
-    if has_retail:
-        df_ret = df[df["retail"]].copy()
-        pct = int(round((1 - RETAIL_QUANTILE) * 100))
-        print(f"\nRetail PROXY label: {len(df_ret)}/{len(df)} candidates flagged "
-              f"(top {pct}% of {RETAIL_TURNOVER_W:g}*turnover + {RETAIL_PRICE_W:g}*(1-price) rank).")
-        print("  NOTE: this is a PROXY for retail participation, not a measurement — turnover")
-        print("  captures total churn (institutional + retail) and correlates with "
-              "small/illiquid names.")
-        wf_ret, best_ret = run_universe(df_ret, "RETAIL SUBSET (proxy; PRIMARY deliverable)",
-                                        SUMMARY_RETAIL_PATH)
-        fig_df, fig_wf, fig_best = df_ret, wf_ret, best_ret
-    else:
-        print("\nNo `entry_dollar_volume` column found — RETAIL analysis SKIPPED.")
-        print("  Re-run `python backtest.py --months 36` to capture entry-day dollar volume")
-        print("  (and the spy_ret_* columns) before the retail subset can be built.")
-        fig_df, fig_wf, fig_best = df, wf_full, best_full
-
-    headline = fig_wf["modal_config"] or fig_best
-    make_figure(fig_df, fig_wf, headline)
+    headline = wf["modal_config"] or best
+    make_figure(df, wf, headline)
 
 
 if __name__ == "__main__":

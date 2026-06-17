@@ -26,22 +26,21 @@ What v1 *didn't* do was establish that the underlying signal was worth trading. 
 
 v2 stepped back from building and asked the question v1 had skipped: *does this signal have edge, after costs, out-of-sample?* That meant abandoning portfolio construction for proper hypothesis testing.
 
-The backtest harness (`backtest.py` + `backtest_analyze.py`, on Financial Modeling Prep data) is built around a clean separation: an expensive run-once step scores every in-window transcript and prices forward returns at several intraday horizons; a cheap, re-runnable step then sweeps thresholds, signal definitions, directions (fade vs. momentum), and report timing (AMC vs. BMO), applies a flat 40 bps round-trip cost, splits train/test, and prints a blunt **GO / MARGINAL / KILL** verdict. The point was never to confirm the strategy — it was to find out, cheaply, whether there was anything there before committing to a real-time rewrite.
+The backtest harness (`backtest.py` + `backtest_analyze.py`, on Financial Modeling Prep data) is built around a clean separation: an expensive run-once step scores every in-window transcript and prices forward returns at several intraday horizons; a cheap, re-runnable step then sweeps thresholds, signal definitions, and directions (fade vs. momentum), applies a flat 40 bps round-trip cost, splits train/test, and prints a blunt **GO / MARGINAL / KILL** verdict. The point was never to confirm the strategy — it was to find out, cheaply, whether there was anything there before committing to a real-time rewrite.
 
 ### v3 — Trust the measurement first (`master`, in progress)
 
-v3 began with an uncomfortable discovery: **the v2 backtest was measuring the wrong trade.** FMP caps rows per request and returns the most recent bars first, so the single 9-day price window per candidate silently dropped its early sessions — entries landed roughly five sessions late instead of at the intended next-session open. Every return column was contaminated.
+v3 began with an uncomfortable discovery: **the v2 backtest was measuring the wrong trade.** FMP caps rows per request and returns the most recent bars first, so the single 9-day price window per candidate silently dropped its early sessions — entries landed roughly five sessions late instead of at the intended next-session open. Every return column was contaminated. That pricing bug has since been fixed directly in `backtest.py`.
 
-Rather than re-run the expensive scoring, `reprice_trades.py` corrects only the pricing: the signal columns (composite, z-scores, priors) are price-independent and carry over untouched, while entries and forward returns are re-fetched one session at a time, safely under FMP's caps. The output (`backtest_trades_repriced.csv`) feeds straight back into the analyzer.
+v3 also dropped two pieces of scope that turned out not to matter for the question being asked: the universe is no longer filtered down to a retail-liquidity subset, and entries no longer condition on whether a report landed before or after market close — only the calendar day matters now. Pricing moved from intraday bars to daily bars, with forward returns measured at 1/3/5 trading days.
 
 **Current plans, in order:**
 
-1. **Reprice and re-validate.** Run the corrected trades through `backtest_analyze.py` and treat *that* verdict — not v2's — as the real one.
-2. **Fix `report_timing`.** It is currently degenerate (everything labels as `BMO`), so genuine before-open reports are entered a session late and the AMC-fade hypothesis can't be tested yet. A timing relabel is the next prerequisite.
-3. **Clean the universe.** Foreign-suffixed listings carry local-currency caps and non-ET sessions; `--us-only` drops them for now.
-4. **Then, and only if an edge survives:** the streaming/intraday execution rewrite — moving away from the daily Markowitz rebalance toward something that can actually act on a short-horizon signal.
+1. **Re-validate on daily pricing.** Run the backtest through `backtest_analyze.py` and treat that verdict as the real one.
+2. **Clean the universe.** Foreign-suffixed listings carry local-currency caps and non-ET sessions; filtering these out is still on the table.
+3. **Then, and only if an edge survives:** the streaming execution rewrite — moving away from the daily Markowitz rebalance toward something that can actually act on a short-horizon signal.
 
-The honest possibility remains that the corrected backtest kills the signal. That would be the most valuable result the project could produce, and it would cost nothing further to learn.
+The honest possibility remains that the backtest kills the signal. That would be the most valuable result the project could produce, and it would cost nothing further to learn.
 
 ---
 
@@ -132,12 +131,10 @@ The backtest runs on Financial Modeling Prep data and is independent of IBKR.
 export FMP_API_KEY=...
 
 python backtest.py --months 12            # expensive: score + price all candidates
-python reprice_trades.py --us-only        # v3 fix: correct the entry-lag pricing bug
-python backtest_analyze.py backtest_trades_repriced.csv   # cheap: sweep + verdict
+python backtest_analyze.py                # cheap: sweep + verdict
 ```
 
-- `backtest.py` writes `backtest_trades.csv` — one row per priced candidate, with signal columns and forward gross returns. It does **not** apply thresholds, direction, or cost.
-- `reprice_trades.py` corrects only the entry/return columns (see v3 above) and writes `backtest_trades_repriced.csv`. It checkpoints every 200 rows and resumes if interrupted.
+- `backtest.py` writes `backtest_trades.csv` — one row per priced candidate, with signal columns and forward gross returns at 1/3/5 trading days (daily bars; entry is always the next trading day's open after the report date). It does **not** apply thresholds, direction, or cost.
 - `backtest_analyze.py` sweeps configurations, applies the 40 bps round-trip cost, validates train/test, writes `backtest_summary.csv` + `backtest_figure.png`, and prints the verdict.
 
 ---
@@ -171,7 +168,6 @@ git checkout master    # current work
 | `persistence.py` | JSON/CSV state for scores, positions, performance |
 | `fmp_client.py` | Financial Modeling Prep API wrapper (backtest) |
 | `backtest.py` | Candidate generation + forward pricing |
-| `reprice_trades.py` | v3 entry-lag fix; re-prices trades without re-scoring |
 | `backtest_analyze.py` | Threshold/direction sweep, cost, OOS verdict |
 
 ## Generated files (gitignored)

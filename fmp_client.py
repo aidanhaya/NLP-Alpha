@@ -11,7 +11,7 @@ directly (`python fmp_client.py AAPL`) for a quick smoke test of each endpoint.
     transcript (one)     : /stable/earning-call-transcript?symbol=&year=&quarter=
     transcript dates     : /stable/earning-call-transcript-dates?symbol=
     historical mkt cap   : /stable/historical-market-capitalization?symbol=&from=&to=
-    intraday bars        : /stable/historical-chart/{interval}?symbol=&from=&to=
+    daily bars           : /stable/historical-price-eod/dividend-adjusted?symbol=&from=&to=
 
 API key is read from the FMP_API_KEY environment variable.
 All datetimes are treated as US/Eastern (FMP's convention for US equities).
@@ -148,38 +148,6 @@ class FMPClient:
             "content": content or "",
         }
 
-    # --- report timing (BMO / AMC) from the earnings calendar ---
-
-    def earnings_timing(self, symbol: str) -> dict:
-        """
-        Map {date -> 'BMO'|'AMC'|'during'|'unknown'} for a symbol's earnings, read from
-        the earnings-calendar `time` field. The transcript endpoints are date-only, so
-        this is the ONLY place the before/after-close label lives.
-
-        VERIFY against your own account once: the stable path is `earnings` (per-symbol
-        history) on most tiers, but some accounts expose it as `earnings-calendar` with a
-        symbol param. The `time` field is usually 'bmo'/'amc'/'dmh'/'--'; we also try a few
-        alternate spellings. Fails soft to {} so a wrong path degrades to 'unknown'
-        timing rather than crashing — watch the timing mix in the run summary to confirm
-        the join actually populated.
-        """
-        rows = None
-        for path in ("earnings", "earnings-calendar"):
-            try:
-                rows = self._get(path, symbol=symbol.upper())
-                if rows:
-                    break
-            except requests.exceptions.HTTPError:
-                continue
-        out = {}
-        for row in rows or []:
-            d = parse_fmp_datetime(_first(row, "date", "datetime"))
-            raw = _first(row, "time", "timing", "hour", "announcementTime")
-            if d is None:
-                continue
-            out[d.date()] = _normalize_timing(raw)
-        return out
-
     # --- point-in-time market cap ---
 
     def historical_market_cap(self, symbol: str,
@@ -200,30 +168,29 @@ class FMPClient:
         series.sort(key=lambda x: x[0])
         return series
 
-    # --- intraday bars ---
+    # --- daily bars ---
 
-    def intraday_bars(self, symbol: str, interval: str,
-                      start: date, end: date) -> list[dict]:
+    def daily_bars(self, symbol: str, start: date, end: date) -> list[dict]:
         """
-        OHLCV bars for [start, end]. interval in {'1min','5min','15min','1hour',...}.
-        Returns [{dt (datetime ET), open, high, low, close, volume}, ...] ascending.
+        Daily split- and dividend-adjusted OHLCV bars for [start, end].
+        Returns [{date, open, high, low, close, volume}, ...] ascending.
         """
-        rows = self._get(f"historical-chart/{interval}", symbol=symbol.upper(),
+        rows = self._get("historical-price-eod/dividend-adjusted", symbol=symbol.upper(),
                          **{"from": start.isoformat(), "to": end.isoformat()})
         bars = []
         for row in rows or []:
-            dt = parse_fmp_datetime(_first(row, "date", "datetime"))
-            if not dt:
+            d = parse_fmp_datetime(_first(row, "date", "datetime"))
+            if not d:
                 continue
             bars.append({
-                "dt": dt,
-                "open": _to_float(_first(row, "open")),
-                "high": _to_float(_first(row, "high")),
-                "low": _to_float(_first(row, "low")),
-                "close": _to_float(_first(row, "close")),
+                "date": d.date(),
+                "open": _to_float(_first(row, "adjOpen", "open")),
+                "high": _to_float(_first(row, "adjHigh", "high")),
+                "low": _to_float(_first(row, "adjLow", "low")),
+                "close": _to_float(_first(row, "adjClose", "close")),
                 "volume": _to_float(_first(row, "volume"), default=0.0),
             })
-        bars.sort(key=lambda b: b["dt"])
+        bars.sort(key=lambda b: b["date"])
         return bars
 
 
@@ -234,21 +201,6 @@ def _to_float(v, default=None):
         return float(v)
     except (TypeError, ValueError):
         return default
-
-
-def _normalize_timing(raw) -> str:
-    """FMP earnings 'time' field -> 'BMO'|'AMC'|'during'|'unknown'.
-    Known values: 'bmo', 'amc', 'dmh' (during market hours), '--' / '' / None."""
-    if raw is None:
-        return "unknown"
-    s = str(raw).strip().lower()
-    if s in ("bmo", "before market open", "before open", "pre-market", "premarket"):
-        return "BMO"
-    if s in ("amc", "after market close", "after close", "post-market", "postmarket"):
-        return "AMC"
-    if s in ("dmh", "during market hours", "during"):
-        return "during"
-    return "unknown"
 
 
 def _coerce_year_quarter(yr, q):
@@ -306,15 +258,8 @@ def main():
     mc = c.historical_market_cap(sym, today - timedelta(days=400), today)
     print(f"historical_market_cap: {len(mc)} rows; latest: {mc[-1] if mc else None}")
 
-    tm = c.earnings_timing(sym)
-    sample = sorted(tm.items())[-3:]
-    print(f"earnings_timing: {len(tm)} dated labels; latest: {sample}; "
-          f"distinct values: {sorted(set(tm.values()))}")
-
-    bars = c.intraday_bars(sym, "1min", today - timedelta(days=370),
-                           today - timedelta(days=368))
-    print(f"intraday_bars(1min, ~1yr ago): {len(bars)} bars; "
-          f"first: {bars[0]['dt'] if bars else None}")
+    bars = c.daily_bars(sym, today - timedelta(days=370), today - timedelta(days=350))
+    print(f"daily_bars(~1yr ago): {len(bars)} bars; first: {bars[0]['date'] if bars else None}")
 
 
 if __name__ == "__main__":
