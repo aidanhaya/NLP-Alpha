@@ -51,7 +51,7 @@ Shared across every version:
 1. **Scrape** — transcripts are fetched (Playwright from Motley Fool in the live pipeline; the FMP API in the backtest).
 2. **Preprocess** — each transcript is split into prepared remarks and Q&A, cleaned, and sentence-tokenized.
 3. **Score** — every sentence is scored with [ProsusAI/FinBERT](https://huggingface.co/ProsusAI/finbert). Q&A is weighted more heavily (60/40) because it is less scripted. The per-transcript **composite** is mean positive minus mean negative probability.
-4. **Signal** — a per-ticker drift signal is computed from how composite sentiment changes across a company's transcripts (a simple diff plus, once enough history exists, a residual-drift term), z-scored against the ticker's own history and blended with the current level.
+4. **Signal** — a per-ticker drift signal is computed from how composite sentiment changes across a company's transcripts (a simple diff plus, once enough history exists, a deviation from a trailing 4-quarter EWMA baseline), z-scored against the ticker's own history and blended with the current level.
 5. **Rank** — tickers are ranked and the top percentile (default 20%) becomes the investable universe.
 
 ---

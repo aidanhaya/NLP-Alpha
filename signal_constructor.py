@@ -2,16 +2,19 @@ import pandas as pd
 import numpy as np
 
 class SentimentSignal:
+    DRIFT_WINDOW = 4  # trailing quarters used as the short-term sentiment baseline
+
     def __init__(self):
         # maps each ticker to a list of scored transcript records (chronological)
         self.history: dict[str, list] = {}
 
-    def _residual_drift(self, records: list) -> float:
+    def _ewma_drift(self, records: list) -> float:
         scores = [r["composite"] for r in records]
-        x = list(range(len(scores)))
-        slope, intercept = np.polyfit(x, scores, 1)
-        predicted = slope * (len(scores) - 1) + intercept
-        return scores[-1] - predicted
+        current = scores[-1]
+        # window excludes the current point so it can't pull its own baseline toward it
+        window = scores[-(self.DRIFT_WINDOW + 1):-1]
+        baseline = pd.Series(window).ewm(span=len(window), adjust=False).mean().iloc[-1]
+        return current - baseline
 
     def _calculate_drift(self, records: list) -> float:
         n = len(records)
@@ -25,11 +28,12 @@ class SentimentSignal:
             hist = [scores[i] - scores[i - 1] for i in range(1, n - 1)]
             components.append((raw, hist, 1.0)) # tuple: (value, history, base weight)
 
-        # Residual drift - available if n >= 8
-        if n >= 8:
-            raw = self._residual_drift(records) # raw residual
-            # lower bound at 8 because _residual_drift needs at least 8 data points
-            hist = [self._residual_drift(records[:i]) for i in range(8, n)]
+        # EWMA drift - needs a full trailing window of priors, plus one more
+        # point so there's at least 2 historical drift values to z-score against
+        min_n = self.DRIFT_WINDOW + 3
+        if n >= min_n:
+            raw = self._ewma_drift(records)
+            hist = [self._ewma_drift(records[:i]) for i in range(self.DRIFT_WINDOW + 1, n)]
             components.append((raw, hist, 3.0)) # weighted most heavily
 
         if not components:
