@@ -20,6 +20,18 @@ Two aggregations per dimension (12 features total):
                        frac_low_relevant (evasive non-answers) are the thesis, but we emit
                        the tail for all six so Phase 4 can decide which carry the edge.
 
+Plus a 7th metric, numerical density, that is TEXT-DERIVED rather than a model output —
+it measures how heavily management quantifies its answers (digits, %, currency, magnitude
+words like "billion"/"bps"), a proxy for concrete vs. hand-waving disclosure. It does NOT
+go through the GPU/score_pairs; it is a deterministic regex count over each answer, so it
+is computed directly in the aggregator where the raw Q&A text is in scope. Same two-feature
+shape as the model dims (14 features total):
+  * numerical_density_mean        — mean quantitative tokens per 100 words across answers.
+  * frac_low_numerical_density    — fraction of answers citing ZERO quantitative tokens
+                                    (the non-numeric / qualitative-only tail).
+Unlike the model dims this is an unbounded density, NOT a 0-2 score; Phase 4 normalizes
+features anyway, so it is kept on its native scale rather than squashed for false parity.
+
 The FinBERT cache (backtest_scores.json) is untouched; its composite stays a feature.
 Cache lives in its own file (subjectivity_scores.json), keyed "SYM:year:Q" exactly like
 backtest_scores.json.
@@ -31,6 +43,7 @@ Smoke test:
 
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -44,6 +57,55 @@ N_CLASSES = 3                       # 0 = neg-demonstrative, 1 = neutral, 2 = po
 LOW_CUTOFF = 0.8                    # an answer counts as "low" on a dim if its 0-2 score < this
 DEFAULT_MODEL_DIR = "subjectivity_model"
 SUBJECTIVITY_CACHE_PATH = "subjectivity_scores.json"
+
+# --- numerical density (13th metric; text-derived, not a model output) ---
+#
+# A figure counts as a "quantitative business token" if it is a number that is either
+# (a) decorated with a currency sign, a percent/points/bps unit, or a magnitude word, or
+# (b) a decimal / comma-grouped number (3.5, 1,200) — which is essentially never a bare
+# year or count. Plain bare integers also count EXCEPT calendar years (1990-2099) and
+# quarter/fiscal-year labels (Q3, FY24, '24), which every call repeats and which carry no
+# disclosure signal. This deliberately ignores spelled-out numbers ("two", "a few") to
+# avoid false hits like "one of" / "no one".
+_QUANT_UNIT = (r"%|percent(?:age)?(?:\s+points?)?|pts?|bps|basis\s+points?|"
+               r"thousand|million|billion|trillion|bn|mm")
+_NUM_RE = re.compile(
+    r"(?P<cur>\$)?(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>" + _QUANT_UNIT + r")?",
+    re.IGNORECASE,
+)
+_YEAR_LO, _YEAR_HI = 1990, 2099
+
+
+def count_quantitative_tokens(text: str) -> int:
+    """Number of quantitative business figures in `text` (see module + config notes).
+
+    Excludes bare calendar years and quarter/fiscal labels so a transcript isn't scored
+    "numerical" just for saying "in Q3 2025" every other sentence."""
+    if not text:
+        return 0
+    n = 0
+    for m in _NUM_RE.finditer(text):
+        core = m.group("num")
+        # (a)/(b): currency, a unit/magnitude, a decimal, or a thousands separator → keep.
+        if m.group("cur") or m.group("unit") or "." in core or "," in core:
+            n += 1
+            continue
+        # bare integer: drop 4-digit calendar years and quarter/fiscal-year labels.
+        if len(core) == 4 and _YEAR_LO <= int(core) <= _YEAR_HI:
+            continue
+        prev = text[max(0, m.start() - 2):m.start()]
+        if prev[-1:] in ("Q", "q", "'", "’") or prev.lower() == "fy":
+            continue
+        n += 1
+    return n
+
+
+def numerical_density(text: str) -> float:
+    """Quantitative tokens per 100 words of `text` (length-normalized; 0.0 if empty)."""
+    words = len(text.split()) if text else 0
+    if words == 0:
+        return 0.0
+    return 100.0 * count_quantitative_tokens(text) / words
 
 
 class SubjectivityScorer:
@@ -143,6 +205,9 @@ def _empty_features(dimensions: list[str]) -> dict:
         dl = d.lower()
         feats[f"{dl}_mean"] = None
         feats[f"frac_low_{dl}"] = None
+    # 7th metric (text-derived); same None-not-fake-zero policy.
+    feats["numerical_density_mean"] = None
+    feats["frac_low_numerical_density"] = None
     return feats
 
 
@@ -171,6 +236,16 @@ def score_transcript_subjectivity(qa_pairs: list[dict], ticker: str, date: str,
         dl = d.lower()
         features[f"{dl}_mean"] = float(a.mean())
         features[f"frac_low_{dl}"] = float((a < low_cutoff).mean())
+
+    # 7th metric: numerical density over management's ANSWERS (text-derived, no model).
+    # Mirror the model dims' shape: a level (_mean) and a tail (frac_low). The tail here is
+    # answers citing ZERO quantitative tokens — the qualitative / hand-waving non-answer.
+    counts = np.asarray([count_quantitative_tokens(p.get("answer") or "")
+                         for p in qa_pairs], dtype=float)
+    dens = np.asarray([numerical_density(p.get("answer") or "")
+                       for p in qa_pairs], dtype=float)
+    features["numerical_density_mean"] = float(dens.mean())
+    features["frac_low_numerical_density"] = float((counts == 0).mean())
 
     return {"ticker": ticker, "date": date, "n_pairs": len(scored), "features": features}
 

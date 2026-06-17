@@ -10,3 +10,4 @@ __pycache__/
 transcript_scores.json
 signals_output.csv
 /.claude/settings.local.json
+subjectivity_model/

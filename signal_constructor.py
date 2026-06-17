@@ -4,12 +4,16 @@ import numpy as np
 class SentimentSignal:
     DRIFT_WINDOW = 4  # trailing quarters used as the short-term sentiment baseline
 
-    def __init__(self):
+    def __init__(self, field: str = "composite"):
+        # `field` is the record key the z-math operates on. Defaults to "composite"
+        # (FinBERT) so existing callers are unchanged; pass e.g. "clear_mean" to run the
+        # identical drift/level machinery over a subjectivity dimension instead.
+        self.field = field
         # maps each ticker to a list of scored transcript records (chronological)
         self.history: dict[str, list] = {}
 
     def _ewma_drift(self, records: list) -> float:
-        scores = [r["composite"] for r in records]
+        scores = [r[self.field] for r in records]
         current = scores[-1]
         # window excludes the current point so it can't pull its own baseline toward it
         window = scores[-(self.DRIFT_WINDOW + 1):-1]
@@ -19,7 +23,7 @@ class SentimentSignal:
     def _calculate_drift(self, records: list) -> float:
         n = len(records)
 
-        scores = [r["composite"] for r in records]
+        scores = [r[self.field] for r in records]
         components = []
 
         # Simple diff - always available if n >= 2
@@ -70,7 +74,7 @@ class SentimentSignal:
             return {"signal": 0.0, "reason": "no data"}
 
         records = self.history[ticker]
-        current = records[-1]["composite"]
+        current = records[-1][self.field]
 
         drift = self._calculate_drift(records)
 
@@ -82,7 +86,7 @@ class SentimentSignal:
         return {
             "ticker": ticker,
             "current_score": current,
-            "prior_score": records[-2]["composite"] if len(records) >= 2 else None,
+            "prior_score": records[-2][self.field] if len(records) >= 2 else None,
             "drift": drift,
             "signal": signal,
         }

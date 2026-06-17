@@ -31,6 +31,7 @@ from tqdm import tqdm
 import preprocessing as pp          # reused: split_transcript, sentence_tokenize
 import signal_constructor as sc     # reused: SentimentSignal (point-in-time drift/z)
 import sentiment_scoring as scr     # reused: avoids importing torch unless we score
+import subjectivity_scoring as subj # reused: SubjectivityScorer + its own on-disk cache
 from fmp_client import FMPClient
 
 # --- config ---
@@ -48,10 +49,23 @@ HORIZON_DAYS = {"ret_30d": 30, "ret_90d": 90, "ret_180d": 180}
 # span and run-time edge cases.
 PRICE_WINDOW_DAYS = 290
 
+# canonical lowercase order of the six SubjECTive-QA dimensions, matching
+# train_subjectivity.DIMENSIONS lowercased. Hardcoded (not read off the loaded
+# checkpoint) so the trade schema is fixed at import time; run() validates the loaded
+# SubjectivityScorer's dimensions against this list and fails loudly on a mismatch.
+SUBJ_DIMS = ["assertive", "cautious", "optimistic", "specific", "clear", "relevant"]
+# per-dimension signals: drift_z is the primary trigger (tone shift vs. the firm's own
+# trend), level_z is a control feature left for the ElasticNet to keep or zero out, and
+# frac_low_z is the lightly z-scored evasiveness tail (most informative for clear/relevant,
+# but emitted for all six so Phase 4 can decide which carry the edge).
+SUBJ_DIM_METRICS = ["level_z", "drift_z", "frac_low_z"]
+SUBJ_DIM_FIELDS = [f"{m}_{dl}" for dl in SUBJ_DIMS for m in SUBJ_DIM_METRICS]
+
 TRADE_FIELDS = [
     "symbol", "year", "quarter", "transcript_dt",
     "market_cap", "composite", "n_priors",
     "level_z", "drift_z", "signal_blend",
+    *SUBJ_DIM_FIELDS,
     "entry_date", "entry_price",
     "ret_30d", "ret_90d", "ret_180d",
     # per-trade market (SPY) matched returns
@@ -59,6 +73,12 @@ TRADE_FIELDS = [
 ]
 
 SPY_SYMBOL = "SPY"
+
+
+def _empty_dim_fields() -> dict:
+    """All 18 per-dimension z-fields set to None (subjectivity data missing/insufficient
+    for this candidate). None-not-fake-zero, matching subjectivity_scoring.py's convention."""
+    return {f: None for f in SUBJ_DIM_FIELDS}
 
 
 @dataclass
@@ -73,6 +93,7 @@ class Candidate:
     level_z: float
     drift_z: float
     signal_blend: float
+    dim_signals: dict          # the 18 SUBJ_DIM_FIELDS -> float|None
     entry_date: str
     entry_price: float
     ret_30d: float
@@ -83,7 +104,7 @@ class Candidate:
     spy_ret_180d: float
 
     def row(self) -> dict:
-        return {
+        out = {
             "symbol": self.symbol, "year": self.year, "quarter": self.quarter,
             "transcript_dt": self.transcript_dt,
             "market_cap": self.market_cap, "composite": round(self.composite, 6),
@@ -96,6 +117,8 @@ class Candidate:
             "spy_ret_30d": _r(self.spy_ret_30d, 6), "spy_ret_90d": _r(self.spy_ret_90d, 6),
             "spy_ret_180d": _r(self.spy_ret_180d, 6),
         }
+        out.update({k: _r(v) for k, v in self.dim_signals.items()})
+        return out
 
 
 def _r(v, nd=4):
@@ -137,22 +160,53 @@ def composite_for(client, scorer, cache, symbol, year, quarter) -> float | None:
 
 # --- triggers ---
 
-def point_in_time_z(prior_composites: list[float], current: float) -> float:
-    """Level z-score of current composite vs PRIOR composites (priors only, no leak)."""
-    if len(prior_composites) < 2:
+def point_in_time_z(prior_values: list[float], current: float) -> float:
+    """Level z-score of `current` vs PRIOR values (priors only, no leak). Field-agnostic:
+    the caller extracts whichever field's values (composite, a {dim}_mean, ...) into the list."""
+    if len(prior_values) < 2:
         return 0.0
-    arr = np.asarray(prior_composites, dtype=float)
+    arr = np.asarray(prior_values, dtype=float)
     mu, sd = arr.mean(), arr.std()
     return float((current - mu) / sd) if sd > 0 else 0.0
 
 
-def drift_and_signal(records_through_i: list[dict]) -> tuple[float, float]:
-    """Reuse SentimentSignal for the blended drift-z and full signal, as of transcript i."""
-    sig = sc.SentimentSignal()
+def drift_and_signal(records_through_i: list[dict],
+                     field: str = "composite") -> tuple[float, float]:
+    """Reuse SentimentSignal for the blended drift-z and full signal, as of transcript i.
+    `field` selects the record key to operate on (defaults to FinBERT's "composite")."""
+    sig = sc.SentimentSignal(field=field)
     for rec in records_through_i:
         sig.add_score(rec)
     out = sig.get_signal(records_through_i[-1]["ticker"])
     return float(out.get("drift", 0.0)), float(out.get("signal", 0.0))
+
+
+def dim_signals_for(subj_history: list[dict]) -> dict:
+    """level_z_{dim}/drift_z_{dim}/frac_low_z_{dim} for each of the six subjectivity
+    dimensions, as of the LAST entry in subj_history (the current transcript). Exactly
+    mirrors composite's level_z/drift_and_signal pattern, just looped over SUBJ_DIMS and
+    over the {dim}_mean / frac_low_{dim} fields instead of "composite" — same point_in_time_z
+    and drift_and_signal calls, no new math. None-filled if this ticker doesn't yet have a
+    full MIN_PRIOR_TRANSCRIPTS subjectivity baseline.
+
+    Caller contract: only call this when subj_history's last entry IS the current
+    transcript (i.e. this transcript actually produced subjectivity features) — otherwise
+    "current" would silently be a stale prior quarter.
+    """
+    out = _empty_dim_fields()
+    priors_window = subj_history[:-1][-MAX_PRIOR_TRANSCRIPTS:]
+    if len(priors_window) < MIN_PRIOR_TRANSCRIPTS:
+        return out
+    recs_i = subj_history[-(MAX_PRIOR_TRANSCRIPTS + 1):]   # bounded window incl. current
+    current = subj_history[-1]
+    for dl in SUBJ_DIMS:
+        mean_key, frac_key = f"{dl}_mean", f"frac_low_{dl}"
+        level_vals = [h[mean_key] for h in priors_window]
+        frac_vals = [h[frac_key] for h in priors_window]
+        out[f"level_z_{dl}"] = point_in_time_z(level_vals, current[mean_key])
+        out[f"drift_z_{dl}"], _ = drift_and_signal(recs_i, field=mean_key)
+        out[f"frac_low_z_{dl}"] = point_in_time_z(frac_vals, current[frac_key])
+    return out
 
 
 # --- entry timing ---
@@ -251,6 +305,17 @@ def run(months: int, max_tickers: int | None):
 
     scorer = scr.FinBERTScorer()
     cache = load_score_cache()
+
+    sub_scorer = subj.SubjectivityScorer()
+    loaded_dims = [d.lower() for d in sub_scorer.dimensions]
+    if loaded_dims != SUBJ_DIMS:
+        raise ValueError(
+            f"subjectivity_model dimensions {loaded_dims} don't match the canonical "
+            f"SUBJ_DIMS order {SUBJ_DIMS} backtest.py's trade schema is built from. "
+            "Update SUBJ_DIMS if the checkpoint's dimension set/order changed."
+        )
+    subj_cache = subj.load_subjectivity_cache()
+
     candidates: list[Candidate] = []
     skips = {"mcap": 0, "priors": 0, "no_bars": 0, "no_composite": 0}
 
@@ -287,7 +352,9 @@ def run(months: int, max_tickers: int | None):
             skips["mcap"] += len(by_symbol[symbol])
             continue
 
-        history: list[dict] = []   # chronological scored {ticker,date,composite}
+        history: list[dict] = []        # chronological scored {ticker,date,composite}
+        subj_history: list[dict] = []   # chronological {ticker,date,{dim}_mean,frac_low_{dim}}
+                                         # (only transcripts with parseable Q&A get appended)
 
         for rec in tqdm(all_dates, desc=symbol, leave=False, unit="qtr"):  # oldest -> newest
             yr, q, tdt = rec["year"], rec["quarter"], rec["dt"]
@@ -300,6 +367,23 @@ def run(months: int, max_tickers: int | None):
                 continue
             ddate = (tdt.date() if tdt else date(yr, 1, 1))
             history.append({"ticker": symbol, "date": ddate.isoformat(), "composite": comp})
+
+            # subjectivity features, built up every transcript (in/out of window) just like
+            # `history` above, so later windows have a full prior baseline. Only appended
+            # when this transcript actually segmented Q&A pairs (sub_rec/features non-None) —
+            # otherwise subj_history's last entry would silently be a stale prior quarter.
+            sub_rec = None
+            try:
+                sub_rec = subj.subjectivity_features_for(client, sub_scorer, subj_cache,
+                                                          symbol, yr, q)
+            except Exception as e:
+                tqdm.write(f"  > subjectivity score error {symbol} {yr}Q{q}: {e}")
+            have_subj_now = False
+            if sub_rec is not None:
+                have_subj_now = sub_rec["features"].get(f"{SUBJ_DIMS[0]}_mean") is not None
+            if have_subj_now:
+                subj_history.append({"ticker": symbol, "date": ddate.isoformat(),
+                                     **sub_rec["features"]})
 
             # only generate a trade for transcripts inside the window
             if (yr, q) not in window_keys:
@@ -317,6 +401,7 @@ def run(months: int, max_tickers: int | None):
             lvl_z = point_in_time_z(priors, comp)
             recs_i = history[-(MAX_PRIOR_TRANSCRIPTS + 1):]   # bounded window incl. current
             drift_z, sig_blend = drift_and_signal(recs_i)
+            dim_fields = dim_signals_for(subj_history) if have_subj_now else _empty_dim_fields()
 
             try:
                 priced = price_trade(client, symbol, w["dt"])
@@ -336,6 +421,7 @@ def run(months: int, max_tickers: int | None):
                 transcript_dt=(w["dt"].isoformat() if w["dt"] else ""),
                 market_cap=mc, composite=comp, n_priors=len(priors),
                 level_z=lvl_z, drift_z=drift_z, signal_blend=sig_blend,
+                dim_signals=dim_fields,
                 entry_date=entry_day.isoformat(), entry_price=entry_px,
                 ret_30d=rets["ret_30d"], ret_90d=rets["ret_90d"], ret_180d=rets["ret_180d"],
                 spy_ret_30d=spy.get("ret_30d"), spy_ret_90d=spy.get("ret_90d"),
@@ -343,8 +429,10 @@ def run(months: int, max_tickers: int | None):
             ))
 
         if n % 25 == 0:
-            save_score_cache(cache)     # checkpoint
+            save_score_cache(cache)          # checkpoint
+            subj.save_subjectivity_cache(subj_cache)
     save_score_cache(cache)
+    subj.save_subjectivity_cache(subj_cache)
 
     with open(TRADES_PATH, "w", newline="") as f:
         wr = csv.DictWriter(f, fieldnames=TRADE_FIELDS)
