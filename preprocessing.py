@@ -8,59 +8,71 @@ def clean_fmp_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 def split_transcript(text: str) -> dict:
-    # Each marker is paired with a list of exclusion phrases.
-    # If any exclusion phrase surrounds the match, it's skipped.
-    qa_markers = [
-        "question-and-answer",
-        "questions and answers",
-        "q&a",
-        "question and answer session",
-        "operator instructions",
-        "we will now begin",
-    ]
-
-    # Phrases that contain a marker but are NOT section headers
-    false_positive_patterns = [
-        r"conclude[sd]?\s+(?:the\s+|our\s+)?(?:q&a|question)",
-        r"end[sed]?\s+(?:the\s+|our\s+)?(?:q&a|question)",
-        r"close[sd]?\s+(?:the\s+|our\s+)?(?:q&a|question)",
-        r"thank\s+you\s+for\s+(?:the\s+|your\s+)?(?:q&a|question)",
-        r"no\s+further\s+questions",
-        r"that\s+(?:concludes|ends|completes)\s+",
-    ]
-
-    false_positive_re = re.compile(
-        "|".join(false_positive_patterns), re.IGNORECASE
-    )
+    """
+    Splits prepared remarks from Q&A at the moderator's handoff to the first analyst
+    question (e.g. "...take our first question from Erik Woodring...").
+    """
+    handoff_markers = ["first question", "first caller"]
 
     text_lower = text.lower()
-    split_idx = len(text)  # default: no Q&A found
+    split_idx = None
+    for marker in handoff_markers:
+        idx = text_lower.find(marker)
+        if idx != -1 and (split_idx is None or idx < split_idx):
+            split_idx = idx
 
-    for marker in qa_markers:
-        search_start = 0
-        while True:
-            idx = text_lower.find(marker, search_start) # -1 if none found
-            if idx == -1:
-                break
-
-            # Grab a window of surrounding text to check for false positives
-            window_start = max(0, idx - 60)
-            window_end = min(len(text), idx + len(marker) + 60)
-            window = text[window_start:window_end]
-
-            if not false_positive_re.search(window):
-                # Valid match - check if it's earlier than current best
-                if idx < split_idx:
-                    split_idx = idx
-                break  # no need to keep searching for this marker
-
-            # This occurrence was a false positive — keep searching forward
-            search_start = idx + 1
+    if split_idx is None:
+        # Fallback for calls that skip straight to naming the first analyst: the
+        # moderator's *second* handoff still lands squarely inside the Q&A section.
+        idx = text_lower.find("next question")
+        split_idx = idx if idx != -1 else len(text)  # last resort: no Q&A found
 
     return {
         "prepared": text[:split_idx],
         "qa": text[split_idx:],
     }
+
+_FMP_TURN_RE = re.compile(r"^([A-Za-z][\w.'-]*(?:\s+[A-Za-z][\w.'-]*){0,3}):\s*(.+)$")
+
+def segment_qa_pairs(qa_text: str) -> list:
+    # Splits the Q&A half (split_transcript()["qa"]) into [{"question", "answer"}, ...].
+
+    pairs = []
+    pending_q, pending_a = [], []
+    analyst = None  # name identified as the active slot's question-asker
+
+    for raw_line in qa_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = _FMP_TURN_RE.match(line)
+        if not match:
+            continue
+        name, text = match.group(1).strip(), match.group(2).strip()
+
+        if name.lower() == "operator":
+            if pending_q and pending_a:
+                pairs.append({"question": " ".join(pending_q).strip(),
+                              "answer": " ".join(pending_a).strip()})
+                pending_q, pending_a = [], []
+            analyst = None
+            continue
+
+        if analyst is None or name == analyst:
+            analyst = name
+            if pending_a:
+                pairs.append({"question": " ".join(pending_q).strip(),
+                              "answer": " ".join(pending_a).strip()})
+                pending_q, pending_a = [], []
+            pending_q.append(text)
+        else:
+            pending_a.append(text)
+
+    if pending_q and pending_a:
+        pairs.append({"question": " ".join(pending_q).strip(),
+                      "answer": " ".join(pending_a).strip()})
+    return pairs
 
 def clean_text(text: str) -> str:
     # Remove first 3 lines (credits and metadata)
