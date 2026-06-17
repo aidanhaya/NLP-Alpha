@@ -109,9 +109,11 @@ class MultiTaskSubjectivityModel(nn.Module):
         tokenizer = AutoTokenizer.from_pretrained(out_dir)
         return model, tokenizer, meta
 
-    def save(self, out_dir: str, meta: dict):
+    def save(self, out_dir, meta, tokenizer=None):
         os.makedirs(out_dir, exist_ok=True)
-        self.encoder.save_pretrained(out_dir)                  # config.json + model.safetensors
+        self.encoder.save_pretrained(out_dir)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(out_dir)
         torch.save(self.heads.state_dict(), os.path.join(out_dir, HEADS_FILENAME))
         with open(os.path.join(out_dir, META_FILENAME), "w") as f:
             json.dump(meta, f, indent=2)
@@ -303,7 +305,7 @@ def run(args):
                 "best_epoch": epoch, "val_mean_f1": best_f1,
                 "val_metrics": best_val_metrics, "scope_note": SCOPE_NOTE,
             }
-            model.save(args.out_dir, meta)
+            model.save(args.out_dir, meta, tokenizer)
             print(f"  ** new best (mean val F1 {best_f1:.3f}) — checkpoint -> {args.out_dir}/")
 
     # final: reload the best checkpoint and report the held-out TEST table
