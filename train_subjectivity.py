@@ -1,29 +1,23 @@
 """
-train_subjectivity.py — Phase 2: fine-tune a multi-task PLM on SubjECTive-QA.
+Script used to fine-tune a multi-task PLM (RoBERTa) on SubjECTive-QA.
 
-Produces a checkpoint you treat exactly like FinBERT: one shared RoBERTa encoder with
-six independent 3-class classification heads (Assertive, Cautious, Optimistic, Specific,
-Clear, Relevant; labels 0/1/2 = negatively / neutral / positively demonstrative). Phase 3
-loads this checkpoint and runs inference over your QA-pair corpus.
+Produces a checkpoint with 6 independent 3-class classification heads (Assertive, Cautious,
+Optimistic, Specific, Clear, Relevant; labels 0/1/2 = negatively / neutral / positively
+demonstrative). Phase 3 loads this checkpoint and runs inference over the QA-pair corpus.
 
 Design notes:
   * Plain PyTorch loop (no HuggingFace Trainer). Only stable primitives — AutoModel,
     AutoTokenizer, torch — so it doesn't depend on Trainer/TrainingArguments kwargs that
     churn between transformers versions.
-  * bf16 autocast on capable GPUs, else fp32. No GradScaler to babysit.
+  * bf16 autocast on capable GPUs, else fp32. No GradScaler.
   * Per-head accuracy + macro-F1 reported every epoch and on the held-out test split.
-    The aggregate hides weak heads; the per-head table is the thing to read.
   * Inverse-frequency class weights (on by default) so heads don't collapse to the
     majority "neutral" class on imbalanced dimensions. Disable with --no-class-weights.
 
-SCOPE NOTE (logged into the checkpoint meta): trained on SubjECTive-QA only — 120
+SCOPE NOTE (logged into the checkpoint meta): trained on SubjECTive-QA only, 120
 large-cap NYSE companies, 2007-2021, QA pairs only, NO in-domain relabel. Transfer to a
 broader / smaller-cap universe is UNVALIDATED. If a dimension's feature looks dead
 downstream, suspect transfer before concluding the dimension is uninformative.
-
-Run:
-    export HF_TOKEN=hf_...            # account must have accepted the dataset terms
-    python train_subjectivity.py --dataset-config 5768
 """
 
 import argparse
@@ -40,11 +34,12 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from datasets import load_dataset
 
-# --- dataset constants (verified against gtfintechlab/SubjECTive-QA schema) ---
+
+# --- dataset constants ---
+
 DATASET_ID = "gtfintechlab/SubjECTive-QA"
 QUESTION_COL = "QUESTION"
 ANSWER_COL = "ANSWER"
-# canonical order — every labels tensor column index maps to this list, everywhere
 DIMENSIONS = ["ASSERTIVE", "CAUTIOUS", "OPTIMISTIC", "SPECIFIC", "CLEAR", "RELEVANT"]
 N_CLASSES = 3
 META_FILENAME = "subjectivity_meta.json"
@@ -67,11 +62,11 @@ class ClassificationHead(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.out = nn.Linear(hidden, n_classes)
 
-    def forward(self, pooled: torch.Tensor) -> torch.Tensor:   # pooled: (B, hidden)
+    def forward(self, pooled: torch.Tensor) -> torch.Tensor: # pooled: (B, hidden)
         x = self.dropout(pooled)
         x = torch.tanh(self.dense(x))
         x = self.dropout(x)
-        return self.out(x)                                     # (B, n_classes)
+        return self.out(x) # (B, n_classes)
 
 
 class MultiTaskSubjectivityModel(nn.Module):
@@ -80,17 +75,20 @@ class MultiTaskSubjectivityModel(nn.Module):
         super().__init__()
         self.encoder = encoder
         self.dimensions = list(dimensions)
-        h = encoder.config.hidden_size
+        h = encoder.config.hidden_size # stores length of internal RoBERTa vectors
+        # creates 6 ClassificationHead instances
         self.heads = nn.ModuleDict(
             {d: ClassificationHead(h, N_CLASSES, dropout) for d in self.dimensions}
         )
 
     def forward(self, input_ids, attention_mask) -> dict:
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = out.last_hidden_state[:, 0]                   # <s> token == [CLS]
+        pooled = out.last_hidden_state[:, 0] # <s> token == [CLS]
+        # does a forward pass on each head and returns them in a dict
         return {d: self.heads[d](pooled) for d in self.dimensions}
 
     # --- constructors ---
+
     @classmethod
     def new(cls, base_model: str, dimensions, dropout: float = 0.1):
         """Fresh model: download the base encoder, attach untrained heads."""
@@ -98,14 +96,15 @@ class MultiTaskSubjectivityModel(nn.Module):
 
     @classmethod
     def load_trained(cls, out_dir: str, device: str = "cpu"):
-        """Reload a saved checkpoint for inference (Phase 3). Returns (model, tokenizer, meta)."""
+        """Reload a saved checkpoint for inference. Returns (model, tokenizer, meta)."""
         with open(os.path.join(out_dir, META_FILENAME)) as f:
-            meta = json.load(f)
-        encoder = AutoModel.from_pretrained(out_dir)           # saved backbone (safetensors)
+            meta = json.load(f) # reads metadata json to get dims and dropout for rebuild
+        encoder = AutoModel.from_pretrained(out_dir)
         model = cls(encoder, meta["dimensions"], meta.get("dropout", 0.1))
+        # loads the saved heads state dict
         state = torch.load(os.path.join(out_dir, HEADS_FILENAME), map_location=device)
-        model.heads.load_state_dict(state)
-        model.to(device).eval()
+        model.heads.load_state_dict(state) # populates heads with saved weights
+        model.to(device).eval() # sets inference mode (disables dropout)
         tokenizer = AutoTokenizer.from_pretrained(out_dir)
         return model, tokenizer, meta
 
@@ -137,10 +136,12 @@ class QADataset(Dataset):
 
 
 def make_collate(tokenizer, max_length: int):
-    """Tokenize each batch as a (question, answer) text-pair with dynamic padding.
+    """
+    Factory function.
+    Tokenize each batch as a (question, answer) text-pair with dynamic padding.
 
-    RoBERTa joins the pair as <s> question </s></s> answer </s> automatically — that's the
-    separator concatenation. truncation=True trims the longer of the two when over budget.
+    RoBERTa joins the pair as <s> question </s></s> answer </s> automatically.
+    truncation=True trims the longer of the two when over budget.
     """
     def collate(batch):
         qs = [b[0] for b in batch]
@@ -157,9 +158,10 @@ def class_weights_from(train_split, dimensions, device):
     Counters the heavy 'neutral' (label 1) skew so heads don't collapse to the majority class."""
     weights = {}
     for d in dimensions:
+        # bincount counts occurrences of each int in the column
         counts = np.bincount(np.asarray(train_split[d], dtype=np.int64), minlength=N_CLASSES).astype(float)
-        counts[counts == 0] = 1.0                              # avoid div-by-zero on absent classes
-        w = counts.sum() / (N_CLASSES * counts)                # inverse frequency
+        counts[counts == 0] = 1.0 # avoid div-by-zero on absent classes
+        w = counts.sum() / (N_CLASSES * counts) # inverse frequency
         weights[d] = torch.tensor(w, dtype=torch.float, device=device)
     return weights
 
@@ -176,19 +178,25 @@ def compute_loss(logits, labels, dimensions, class_weights=None):
 
 
 def macro_f1(preds: np.ndarray, golds: np.ndarray) -> float:
-    """Unweighted mean F1 across the 3 classes (robust to label imbalance)."""
+    """
+    Unweighted mean F1 across the 3 classes (robust to label imbalance).
+    F1 used to evaluate model balance by measuring precision and recall.
+    Low F1 => trade-off b/w precision and recall.
+    High F1 => reliable, balanced model.
+    """
     f1s = []
     for c in range(N_CLASSES):
-        tp = int(((preds == c) & (golds == c)).sum())
-        fp = int(((preds == c) & (golds != c)).sum())
-        fn = int(((preds != c) & (golds == c)).sum())
-        prec = tp / (tp + fp) if (tp + fp) else 0.0
-        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        tp = int(((preds == c) & (golds == c)).sum()) # true positives
+        fp = int(((preds == c) & (golds != c)).sum()) # false positives
+        fn = int(((preds != c) & (golds == c)).sum()) # false negatives
+        prec = tp / (tp + fp) if (tp + fp) else 0.0 # precision
+        rec = tp / (tp + fn) if (tp + fn) else 0.0 # recall
+        # F1 formula
         f1s.append(2 * prec * rec / (prec + rec) if (prec + rec) else 0.0)
     return sum(f1s) / len(f1s)
 
 
-@torch.inference_mode()
+@torch.inference_mode() # decorator to disable gradient tracking during inference
 def evaluate(model, loader, dimensions, device, amp_dtype, autocast_enabled):
     """Per-head accuracy and macro-F1 over a split. Returns {dim: {acc, f1}} plus mean_f1."""
     model.eval()
@@ -203,6 +211,7 @@ def evaluate(model, loader, dimensions, device, amp_dtype, autocast_enabled):
             golds[d].append(labels[:, i].numpy())
     out = {}
     for d in dimensions:
+        # concatenates all batch predictions and golds into full-split arrays
         p = np.concatenate(preds[d]); g = np.concatenate(golds[d])
         out[d] = {"acc": float((p == g).mean()), "f1": macro_f1(p, g)}
     mean_f1 = float(np.mean([out[d]["f1"] for d in dimensions]))
@@ -211,6 +220,7 @@ def evaluate(model, loader, dimensions, device, amp_dtype, autocast_enabled):
 
 def print_table(title, metrics, mean_f1):
     print(f"\n  {title}")
+    # formats a fixed-width table
     print(f"    {'dimension':<12} {'acc':>6} {'macroF1':>8}")
     for d in DIMENSIONS:
         print(f"    {d:<12} {metrics[d]['acc']:>6.3f} {metrics[d]['f1']:>8.3f}")
@@ -229,6 +239,7 @@ def run(args):
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # bf16 preferred over fp16 (better dynamic range, no GradScaler needed)
     use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float32
     autocast_enabled = use_bf16
@@ -238,6 +249,7 @@ def run(args):
 
     print(f"Loading {DATASET_ID} config '{args.dataset_config}' ...")
     ds = load_dataset(DATASET_ID, args.dataset_config)
+    # handles both HF dataset naming conventions
     val_key = "val" if "val" in ds else ("validation" if "validation" in ds else None)
     if val_key is None:
         raise SystemExit(f"No validation split found. Splits present: {list(ds.keys())}")
@@ -255,6 +267,7 @@ def run(args):
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     collate = make_collate(tokenizer, args.max_length)
+    # shuffles examples over every epoch so order isn't learned
     train_loader = DataLoader(QADataset(ds["train"], DIMENSIONS), batch_size=args.batch_size,
                               shuffle=True, collate_fn=collate)
     val_loader = DataLoader(QADataset(ds[val_key], DIMENSIONS), batch_size=args.batch_size,
@@ -268,8 +281,12 @@ def run(args):
 
     model = MultiTaskSubjectivityModel.new(args.base_model, DIMENSIONS, args.dropout).to(device)
 
+    # AdamW applies weight decay separate to gradient update (best for fine-tuning)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_steps = len(train_loader) * args.epochs
+    # LR linearly increases from 0 to args.lr over the first warmup_ratio * total_steps steps
+    # then linearly decays back to 0.
+    # default warmup is 6% of total steps
     scheduler = get_linear_schedule_with_warmup(
         optimizer, int(args.warmup_ratio * total_steps), total_steps)
 
@@ -294,7 +311,7 @@ def run(args):
         print(f"\nEpoch {epoch}/{args.epochs}  train_loss={running / len(train_loader):.4f}")
         print_table("validation", val_metrics, val_f1)
 
-        if val_f1 > best_f1:               # checkpoint the best epoch by mean val macro-F1
+        if val_f1 > best_f1: # checkpoint the best epoch by mean val macro-F1
             best_f1, best_val_metrics = val_f1, val_metrics
             meta = {
                 "base_model": args.base_model, "dimensions": DIMENSIONS,
@@ -314,8 +331,6 @@ def run(args):
     best_model, _, meta = MultiTaskSubjectivityModel.load_trained(args.out_dir, device=str(device))
     test_metrics, test_f1 = evaluate(best_model, test_loader, DIMENSIONS, device, amp_dtype, autocast_enabled)
     print_table("TEST (held-out)", test_metrics, test_f1)
-    print("\n  Read the per-head table, not just MEAN — weak heads become weak features in")
-    print("  the backtest, and you want to know which ones before they mislead you.")
 
     meta["test_mean_f1"] = test_f1
     meta["test_metrics"] = test_metrics
