@@ -61,11 +61,19 @@ SUBJ_DIMS = ["assertive", "cautious", "optimistic", "specific", "clear", "releva
 SUBJ_DIM_METRICS = ["level_z", "drift_z", "frac_low_z"]
 SUBJ_DIM_FIELDS = [f"{m}_{dl}" for dl in SUBJ_DIMS for m in SUBJ_DIM_METRICS]
 
+# numerical_density is a 7th "pseudo-dimension" from subjectivity_scoring.py: a text-derived
+# regex count (no model) stored as numerical_density_mean + frac_low_numerical_density in the
+# subjectivity cache. It gets the same level_z/drift_z treatment as the six model dims, but
+# NOT frac_low_z (the frac_low tail is already its own feature; z-scoring it again is
+# redundant given drift_z already captures the shift).
+NUMDEN_FIELDS = ["level_z_numerical_density", "drift_z_numerical_density"]
+
 TRADE_FIELDS = [
     "symbol", "year", "quarter", "transcript_dt",
     "market_cap", "composite", "n_priors",
     "level_z", "drift_z", "signal_blend",
     *SUBJ_DIM_FIELDS,
+    *NUMDEN_FIELDS,
     "entry_date", "entry_price",
     "ret_30d", "ret_90d", "ret_180d",
     # per-trade market (SPY) matched returns
@@ -76,9 +84,9 @@ SPY_SYMBOL = "SPY"
 
 
 def _empty_dim_fields() -> dict:
-    """All 18 per-dimension z-fields set to None (subjectivity data missing/insufficient
+    """All per-dimension z-fields set to None (subjectivity data missing/insufficient
     for this candidate). None-not-fake-zero, matching subjectivity_scoring.py's convention."""
-    return {f: None for f in SUBJ_DIM_FIELDS}
+    return {f: None for f in [*SUBJ_DIM_FIELDS, *NUMDEN_FIELDS]}
 
 
 @dataclass
@@ -183,11 +191,14 @@ def drift_and_signal(records_through_i: list[dict],
 
 def dim_signals_for(subj_history: list[dict]) -> dict:
     """level_z_{dim}/drift_z_{dim}/frac_low_z_{dim} for each of the six subjectivity
-    dimensions, as of the LAST entry in subj_history (the current transcript). Exactly
-    mirrors composite's level_z/drift_and_signal pattern, just looped over SUBJ_DIMS and
-    over the {dim}_mean / frac_low_{dim} fields instead of "composite" — same point_in_time_z
-    and drift_and_signal calls, no new math. None-filled if this ticker doesn't yet have a
-    full MIN_PRIOR_TRANSCRIPTS subjectivity baseline.
+    dimensions, plus level_z/drift_z for numerical_density, as of the LAST entry in
+    subj_history (the current transcript). Exactly mirrors composite's
+    level_z/drift_and_signal pattern, looped over SUBJ_DIMS and over the {dim}_mean /
+    frac_low_{dim} fields — same point_in_time_z and drift_and_signal calls, no new math.
+    numerical_density gets level_z + drift_z only (no frac_low_z — frac_low_numerical_density
+    is already its own cached feature; z-scoring it again given drift_z captures the shift
+    is redundant). None-filled if this ticker doesn't yet have a full
+    MIN_PRIOR_TRANSCRIPTS subjectivity baseline.
 
     Caller contract: only call this when subj_history's last entry IS the current
     transcript (i.e. this transcript actually produced subjectivity features) — otherwise
@@ -206,6 +217,11 @@ def dim_signals_for(subj_history: list[dict]) -> dict:
         out[f"level_z_{dl}"] = point_in_time_z(level_vals, current[mean_key])
         out[f"drift_z_{dl}"], _ = drift_and_signal(recs_i, field=mean_key)
         out[f"frac_low_z_{dl}"] = point_in_time_z(frac_vals, current[frac_key])
+    # numerical_density: same level_z/drift_z treatment, no frac_low_z (see docstring).
+    nd_key = "numerical_density_mean"
+    nd_level_vals = [h[nd_key] for h in priors_window]
+    out["level_z_numerical_density"] = point_in_time_z(nd_level_vals, current[nd_key])
+    out["drift_z_numerical_density"], _ = drift_and_signal(recs_i, field=nd_key)
     return out
 
 
