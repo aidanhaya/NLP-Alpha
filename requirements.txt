@@ -11,3 +11,4 @@ ib-insync
 matplotlib
 seaborn
 datasets
+scikit-learn
