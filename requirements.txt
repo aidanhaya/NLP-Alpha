@@ -10,3 +10,4 @@ requests==2.34.2
 ib-insync
 matplotlib
 seaborn
+datasets
