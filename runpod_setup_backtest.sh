@@ -198,7 +198,7 @@ try:
     client = FMPClient()
     dates = client.transcript_dates("AAPL")
     last = dates[-1]
-    t = client.get_transcript(last["year"], last["quarter"])  # type: ignore[call-arg]
+    t = client.get_transcript("AAPL", last["year"], last["quarter"])  # type: ignore[call-arg]
     if not t or not t["content"]:
         sys.exit("Smoke test FAILED: empty AAPL transcript.")
 
