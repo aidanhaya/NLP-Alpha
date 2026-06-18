@@ -308,16 +308,24 @@ def run(months: int, max_tickers: int | None):
     # priors need history well before the window:
     prior_lookback_start = start - timedelta(days=365 * 4)
 
-    print(f"Enumerating transcripts {start} -> {end} ...")
-    window = client.list_transcripts_in_window(start, end)
-    by_symbol: dict[str, list] = {}
-    for w in window:
-        by_symbol.setdefault(w["symbol"], []).append(w)
-    symbols = sorted(by_symbol)
+    # NOTE on the window: FMP's "latest" transcript feed (list_transcripts_in_window) has a
+    # SERVER-SIDE result cap — it stops returning rows after ~6 months regardless of our
+    # max_pages, so it CANNOT bound a multi-year window. We therefore use it ONLY to
+    # DISCOVER the active symbol universe. The trade window is derived per-symbol below from
+    # each symbol's OWN full transcript_dates history filtered to [start, end], so
+    # `--months 36` actually produces ~36 months of trades.
+    #
+    # CAVEAT (survivorship): symbols that stopped reporting before the discovery feed's
+    # ~6-month horizon won't be discovered here. Fixing that needs a point-in-time universe
+    # source (e.g. an FMP screener / symbol-list endpoint); this change fixes window DEPTH
+    # for the currently-active universe, which is the immediate blocker.
+    print(f"Discovering symbols via latest-transcript feed ...")
+    discovery = client.list_transcripts_in_window(start, end)
+    symbols = sorted({w["symbol"] for w in discovery})
     if max_tickers:
         symbols = symbols[:max_tickers]
-    print(f"{len(window)} window transcripts across {len(by_symbol)} symbols; "
-          f"processing {len(symbols)}.")
+    print(f"Trade window {start} -> {end} ({months}mo). "
+          f"Discovered {len(symbols)} symbols from feed; processing {len(symbols)}.")
 
     scorer = scr.FinBERTScorer()
     cache = load_score_cache()
@@ -333,7 +341,7 @@ def run(months: int, max_tickers: int | None):
     subj_cache = subj.load_subjectivity_cache()
 
     candidates: list[Candidate] = []
-    skips = {"mcap": 0, "priors": 0, "no_bars": 0, "no_composite": 0}
+    skips = {"mcap": 0, "priors": 0, "no_bars": 0, "no_composite": 0, "no_window": 0}
 
     # Fetch SPY ONCE for the whole window and index by date, so each trade's matched-window
     # market return is priced from cache rather than a per-trade API call. Buffer covers
@@ -352,21 +360,26 @@ def run(months: int, max_tickers: int | None):
             tqdm.write(f"  > metadata error {symbol}: {e}")
             continue
 
-        window_keys = {(w["year"], w["quarter"]): w for w in by_symbol[symbol]}
-
-        # PRE-SCORING mcap gate. A symbol can only produce a trade if it clears
-        # MIN_MARKET_CAP at one of its in-window transcript dates (the same test
-        # applied per-transcript below at the `mc < MIN_MARKET_CAP` skip). If it
-        # never clears the floor, every candidate would be skipped anyway — so cut
-        # the whole symbol here, BEFORE FinBERT-scoring its full history or fetching
-        # any bars. Previously the cap was only checked after scoring, so sub-cap
-        # US names and foreign listings (e.g. *.HK/*.TO/*.L, which have no US mcap
-        # series) were fully scored and then discarded. Output is unchanged: these
-        # symbols contributed zero candidates either way.
-        if all((mcap_at(mc_series, w["date"]) or 0.0) < MIN_MARKET_CAP
-               for w in by_symbol[symbol]):
-            skips["mcap"] += len(by_symbol[symbol])
+        # In-window transcripts now come from the symbol's OWN history (a real datetime,
+        # inside [start, end]) — NOT the truncated discovery feed. This is the whole fix.
+        in_window = [r for r in all_dates
+                     if r["dt"] is not None and start <= r["dt"].date() <= end]
+        if not in_window:
+            skips["no_window"] += 1
             continue
+
+        # PRE-SCORING mcap gate (same intent as before, now over the symbol's OWN in-window
+        # dates). If the name never clears MIN_MARKET_CAP at ANY in-window transcript date,
+        # every candidate would be skipped anyway — so cut the whole symbol BEFORE
+        # FinBERT-scoring its full history or fetching any bars. Foreign listings with no US
+        # mcap series (mcap_at -> None -> treated as 0.0) are still cut here, unchanged.
+        if all((mcap_at(mc_series, r["dt"].date()) or 0.0) < MIN_MARKET_CAP
+               for r in in_window):
+            skips["mcap"] += len(in_window)
+            continue
+
+        # (year, quarter) pairs that fall inside the window for this symbol
+        window_qkeys = {(r["year"], r["quarter"]) for r in in_window}
 
         history: list[dict] = []        # chronological scored {ticker,date,composite}
         subj_history: list[dict] = []   # chronological {ticker,date,{dim}_mean,frac_low_{dim}}
@@ -401,15 +414,17 @@ def run(months: int, max_tickers: int | None):
                 subj_history.append({"ticker": symbol, "date": ddate.isoformat(),
                                      **sub_rec["features"]})
 
-            # only generate a trade for transcripts inside the window
-            if (yr, q) not in window_keys:
+            # Only generate a trade for in-window transcripts. Membership is now the
+            # transcript's OWN (year, quarter), and we require a real datetime so the entry
+            # can be timed/priced. Out-of-window transcripts are still SCORED above (they
+            # feed the priors baseline) — only trade-row generation is gated here.
+            if (yr, q) not in window_qkeys or tdt is None:
                 continue
-            w = window_keys[(yr, q)]
             priors = [h["composite"] for h in history[:-1]][-MAX_PRIOR_TRANSCRIPTS:]
             if len(priors) < MIN_PRIOR_TRANSCRIPTS:
                 skips["priors"] += 1
                 continue
-            mc = mcap_at(mc_series, w["date"])
+            mc = mcap_at(mc_series, ddate)
             if mc is None or mc < MIN_MARKET_CAP:
                 skips["mcap"] += 1
                 continue
@@ -420,7 +435,7 @@ def run(months: int, max_tickers: int | None):
             dim_fields = dim_signals_for(subj_history) if have_subj_now else _empty_dim_fields()
 
             try:
-                priced = price_trade(client, symbol, w["dt"])
+                priced = price_trade(client, symbol, tdt)
             except Exception as e:
                 tqdm.write(f"  > price error {symbol}: {e}")
                 priced = None
@@ -434,7 +449,7 @@ def run(months: int, max_tickers: int | None):
 
             candidates.append(Candidate(
                 symbol=symbol, year=yr, quarter=q,
-                transcript_dt=(w["dt"].isoformat() if w["dt"] else ""),
+                transcript_dt=tdt.isoformat(),
                 market_cap=mc, composite=comp, n_priors=len(priors),
                 level_z=lvl_z, drift_z=drift_z, signal_blend=sig_blend,
                 dim_signals=dim_fields,
