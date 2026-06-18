@@ -112,7 +112,7 @@ class SubjectivityScorer:
     """Inference wrapper over the multi-task SubjECTive-QA checkpoint, mirroring
     FinBERTScorer's shape (device/amp handling, batched fp32-softmax inference)."""
 
-    def __init__(self, model_dir: str = DEFAULT_MODEL_DIR, batch_size: int = 64):
+    def __init__(self, model_dir: str = DEFAULT_MODEL_DIR, batch_size: int = 256):
         # Lazy import: only constructing a scorer needs the model class (and its `datasets`
         # dependency, which is training-only). Keeps `import subjectivity_scoring` cheap.
         from transformers import AutoTokenizer

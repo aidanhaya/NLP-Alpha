@@ -3,7 +3,7 @@ import torch
 import numpy as np
 
 class FinBERTScorer:
-    def __init__(self, batch_size=256):
+    def __init__(self, batch_size=512):
         model_name = "ProsusAI/finbert"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)

@@ -74,7 +74,7 @@ class FMPClient:
     # --- transcript enumeration ---
 
     def list_transcripts_in_window(self, start: date, end: date,
-            page_size: int = 100, max_pages: int = 400) -> list[dict]:
+        page_size: int = 100, max_pages: int = 3000) -> list[dict]:  # was 400
         """
         Walk the latest-transcripts feed backward until we pass `start`.
         Returns dicts: {symbol, year, quarter, dt (datetime, ET), date (date)}.
