@@ -11,3 +11,4 @@ transcript_scores.json
 signals_output.csv
 /.claude/settings.local.json
 subjectivity_model/
+subjectivity_model.tar.gz
