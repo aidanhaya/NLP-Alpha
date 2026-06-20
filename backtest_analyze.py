@@ -691,7 +691,6 @@ def main():
         compare_arms(wf, dump_monthly=args.dump_monthly)
 
     write_summary(all_wf)
-    # --> [0] MARKER <--
     headline = next(wf for wf in all_wf if wf["horizon"] == HEADLINE_HORIZON)
     make_figure(headline)
 
