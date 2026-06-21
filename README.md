@@ -2,7 +2,7 @@
 
 **Natural language processing of earnings call transcripts to predict returns.**
 
-NLP-Alpha scores the tone of earnings-call transcripts with FinBERT and a fine-tuned subjectivity model, turns those scores into per-ticker signals, and runs them through a **point-in-time backtest** that asks, honestly and out-of-sample, whether the signal has any edge at all. An earlier version of the project traded the signal live through Interactive Brokers; that pipeline is preserved at the `v1.0.0` tag (see [Project history](#project-history)).
+NLP-Alpha scores the tone of earnings-call transcripts with FinBERT and a fine-tuned subjectivity model, turns those scores into per-ticker signals, and runs them through a **point-in-time backtest** that determines whether the signal has any edge. An earlier version of the project traded the signal live through Interactive Brokers; that pipeline is preserved at the `v1.0.0` tag (see [Project history](#project-history)).
 
 This repository is the consolidated home of a project that has gone through four tagged milestones. The earliest two lived in separate repos (`NLP-Markowitz`, `NLP-Modified`); all of it now lives here as git tags so the whole arc is in one place.
 
@@ -62,8 +62,8 @@ The backtest runs on Financial Modeling Prep data and is fully self-contained �
 ```bash
 export FMP_API_KEY=...
 
-python backtest.py --months 36          # full run (GPU recommended; ~10h cold)
-python backtest.py --months 36 --max-tickers 50   # pilot
+python backtest.py --months 36 # full run (GPU recommended; ~10h cold)
+python backtest.py --months 36 --max-tickers 50 # pilot
 ```
 
 Writes `backtest_trades.csv` — one row per priced candidate — with:
@@ -82,7 +82,7 @@ Both scorers cache to disk (`backtest_scores.json`, `subjectivity_scores.json`).
 ```bash
 pip install -r requirements.txt
 python backtest_analyze.py
-python backtest_analyze.py --long-only   # trigger only long-side predictions
+python backtest_analyze.py --long-only # trigger only long-side predictions
 ```
 
 Reads `backtest_trades.csv`, writes `backtest_summary.csv` + `backtest_figure.png`.
@@ -110,7 +110,7 @@ The headline is the **subjectivity vs finbert** paired monthly ΔIC at the 90d h
 ```bash
 # On the pod
 export FMP_API_KEY=your_key_here
-export RUNPOD_API_KEY=your_runpod_key   # enables auto-stop on completion
+export RUNPOD_API_KEY=your_runpod_key # enables auto-stop on completion
 bash runpod_setup_backtest.sh
 ```
 
@@ -119,7 +119,7 @@ See `runpod_setup_backtest.sh` for cache-seeding instructions (both score caches
 ### Training the subjectivity model (one-time)
 
 ```bash
-export HF_TOKEN=hf_...    # account must have accepted SubjECTive-QA terms
+export HF_TOKEN=hf_... # account must have accepted SubjECTive-QA terms
 bash runpod_setup_subjectivity.sh
 ```
 
@@ -141,7 +141,7 @@ The original IBKR/Markowitz pipeline — scrape, score, rank, rebalance, execute
 
 ```bash
 git checkout v1.0.0
-cat README.md   # full live-pipeline setup and usage instructions, as they were at v1
+cat README.md # full live-pipeline setup and usage instructions, as they were at v1
 ```
 
 ---
@@ -169,7 +169,6 @@ git checkout master    # current work (== v3.2.0)
 | `subjectivity_scoring.py` | SubjECTive-QA inference, aggregation, and cache |
 | `train_subjectivity.py` | Fine-tune the multi-task subjectivity model (one-time) |
 | `signal_constructor.py` | Field-agnostic drift signal, ranking, investable universe |
-| `persistence.py` | Legacy JSON/CSV state helpers from the live pipeline; unused by the current backtest scripts |
 | `fmp_client.py` | Financial Modeling Prep API wrapper (backtest) |
 | `backtest.py` | Candidate generation, subjectivity scoring, forward pricing |
 | `backtest_analyze.py` | ElasticNet walk-forward, three-arm OOS comparison, verdict |
@@ -177,7 +176,7 @@ git checkout master    # current work (== v3.2.0)
 | `runpod_setup_backtest.sh` | RunPod provisioning (both scorers, current) |
 | `runpod_setup_subjectivity.sh` | RunPod provisioning (subjectivity model training) |
 
-The live pipeline's files (`main.py`, `webscraper.py`, `rebalance.py`, `ibkr_manager.py`, `visualize.py`) are not present on `master` — see [The live pipeline](#the-live-pipeline-archived-at-v100) above.
+The live pipeline's files (`main.py`, `webscraper.py`, `rebalance.py`, `ibkr_manager.py`, `visualize.py`) are not present on `master` — see [the live pipeline](#the-live-pipeline-archived-at-v100) above.
 
 ## Generated files (gitignored)
 
