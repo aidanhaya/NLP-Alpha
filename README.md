@@ -1,10 +1,10 @@
 # NLP-Alpha
 
-**Does earnings-call sentiment actually predict returns — and can you trade it after costs?**
+**Natural language processing of earnings call transcripts to predict returns.**
 
-NLP-Alpha scores the tone of earnings-call transcripts with FinBERT and a fine-tuned subjectivity model, turns those scores into per-ticker signals, and then puts the signals through two very different tests: a **live pipeline** that builds and executes a portfolio through Interactive Brokers, and a **point-in-time backtest** that asks, honestly and out-of-sample, whether the signal has any edge at all.
+NLP-Alpha scores the tone of earnings-call transcripts with FinBERT and a fine-tuned subjectivity model, turns those scores into per-ticker signals, and runs them through a **point-in-time backtest** that asks, honestly and out-of-sample, whether the signal has any edge at all. An earlier version of the project traded the signal live through Interactive Brokers; that pipeline is preserved at the `v1.0.0` tag (see [Project history](#project-history)).
 
-This repository is the consolidated home of a project that has gone through three iterations. Earlier versions lived in separate repos (`NLP-Markowitz`, `NLP-Modified`); they are now preserved here as git tags so the whole arc lives in one place.
+This repository is the consolidated home of a project that has gone through four tagged milestones. The earliest two lived in separate repos (`NLP-Markowitz`, `NLP-Modified`); all of it now lives here as git tags so the whole arc is in one place.
 
 ---
 
@@ -12,33 +12,26 @@ This repository is the consolidated home of a project that has gone through thre
 
 | Version | Tag | Focus |
 | ------- | --- | ----- |
-| **v1** | [`v1.0.0`](../../releases/tag/v1.0.0) | Live FinBERT → Markowitz → IBKR paper-trading pipeline |
-| **v2** | [`v2.0.0`](../../releases/tag/v2.0.0) | Point-in-time backtest harness; cost-aware, out-of-sample edge validation |
-| **v3** | `master` *(current)* | Subjectivity features, model-based walk-forward, honest three-arm OOS comparison |
+| **v1** | [`v1.0.0`](../../releases/tag/v1.0.0) | Motley Fool transcripts → FinBERT → Markowitz → IBKR paper-trading pipeline |
+| **v2** | [`v2.0.0`](../../releases/tag/v2.0.0) | FMP data + FMP transcripts; point-in-time backtest harness |
+| **v3.1** | [`v3.1.0`](../../releases/tag/v3.1.0) | Retail-universe testing; walk-forward CIs, CAPM, SPY-matched returns |
+| **v3.2** | [`v3.2.0`](../../releases/tag/v3.2.0) `master` *(current)* | Multi-faceted sentiment (RoBERTa/SubjECTive-QA), ElasticNet optimization, Newey-West, full 3-year backtest |
 
 ### v1 — The portfolio (`v1.0.0`)
 
-The first version was an end-to-end trading system, optimistic and complete. It scrapes earnings-call transcripts, scores them with FinBERT, ranks tickers by a sentiment **drift** signal, selects a top-percentile investable universe, sizes positions with Markowitz minimum-variance optimization, and executes through the IBKR paper-trading API — with stop-loss, take-profit, time-limit, and signal-dropout exits. It is a working pipeline, and most of it still lives on `master` today.
+The first version was an end-to-end trading system. It scrapes earnings-call transcripts from Motley Fool, scores them with FinBERT, ranks tickers by a sentiment **drift** signal, selects a top-percentile investable universe, sizes positions with Markowitz minimum-variance optimization, and executes through the IBKR paper-trading API — with stop-loss, take-profit, time-limit, and signal-dropout exits. The live pipeline (`main.py`, `webscraper.py`, `rebalance.py`, `ibkr_manager.py`, `visualize.py`) lives only at this tag; see [Working with versions](#working-with-versions) to check it out.
 
-What v1 *didn't* do was establish that the underlying signal was worth trading. It assumed the edge and built the machinery around it.
+### v2 — The backtest (`v2.0.0`)
 
-### v2 — The reckoning (`v2.0.0`)
+v2 moved off live execution and onto Financial Modeling Prep data to test the signal properly, out-of-sample. The backtest harness (`backtest.py` + `backtest_analyze.py`) is built around a clean separation: an expensive run-once step scores every in-window transcript and prices forward returns at several horizons; a cheap, re-runnable step sweeps thresholds, signal definitions, and directions (fade vs. momentum), applies a flat 40 bps round-trip cost, splits train/test, and reports a verdict.
 
-v2 stepped back from building and asked the question v1 had skipped: *does this signal have edge, after costs, out-of-sample?* That meant abandoning portfolio construction for proper hypothesis testing.
+### v3.1 — Sharpening the verdict (`v3.1.0`)
 
-The backtest harness (`backtest.py` + `backtest_analyze.py`, on Financial Modeling Prep data) is built around a clean separation: an expensive run-once step scores every in-window transcript and prices forward returns at several horizons; a cheap, re-runnable step then sweeps thresholds, signal definitions, and directions (fade vs. momentum), applies a flat 40 bps round-trip cost, splits train/test, and reports the verdict. The point was never to confirm the strategy — it was to find out, cheaply, whether there was anything there before committing to a real-time rewrite.
+v3.1 tightened the backtest's claim to credibility: candidates gained a retail-accessibility label (market cap floor, US-listing filter) so the universe matched what a retail account could actually trade, the walk-forward gained confidence intervals and a CAPM-adjusted readout alongside the raw spread, and forward returns were matched against SPY over the identical entry window rather than judged in isolation.
 
-### v3 — Measurement before momentum (`master`)
+### v3.2 — Multi-faceted sentiment (`v3.2.0`, current)
 
-v3 began with an uncomfortable discovery: **the v2 backtest was measuring the wrong trade.** FMP caps rows per request and returns the most recent bars first, so the single 9-day price window per candidate silently dropped its early sessions — entries landed roughly five sessions late instead of at the intended next-session open. Every return column was contaminated. That pricing bug has since been fixed directly in `backtest.py`.
-
-v3 then expanded the signal itself, adding a second scorer alongside FinBERT: a RoBERTa encoder fine-tuned on the SubjECTive-QA dataset with six independent classification heads (Assertive, Cautious, Optimistic, Specific, Clear, Relevant). Each head measures a different dimension of *how* management communicates, orthogonal to FinBERT's polarity. Both scorers run at inference time during `backtest.py` and are cached to disk.
-
-The analyzer was then rewritten to match: the v2 threshold/direction grid sweep was replaced by a regularized linear model (ElasticNetCV) that evaluates a feature *set* — the six subjectivity dimensions — as a unit inside the same anchored walk-forward. The key question it now answers is: **do the six subjectivity dimensions beat FinBERT-alone out-of-sample?** If not, that is a cheap, important negative result before any further investment.
-
-v3 also dropped two pieces of scope that turned out not to matter for the question being asked: the universe is no longer filtered down to a retail-liquidity subset, and entries no longer condition on whether a report landed before or after market close — only the calendar day matters. Pricing moved from intraday bars to daily bars, with forward returns measured at 30/90/180 trading days.
-
-The honest possibility remains that the backtest kills the signal. That would be the most valuable result the project could produce, and it would cost nothing further to learn.
+v3.2 is the largest expansion since v1. It adds a second scorer alongside FinBERT: a RoBERTa encoder fine-tuned on the SubjECTive-QA dataset with six independent classification heads (Assertive, Cautious, Optimistic, Specific, Clear, Relevant) that measure *how* management communicates, orthogonal to FinBERT's polarity. The retail-universe filter from v3.1 was dropped — broadening back out didn't change the verdict — and the analyzer was rewritten around a regularized linear model (`ElasticNetCV`) that evaluates the six subjectivity dimensions as a feature set inside an anchored walk-forward, with Newey-West standard errors to account for the serial correlation between overlapping 30/90/180-day holding periods. The backtest window itself was also extended to a genuine three years: `backtest.py` now derives each symbol's trade window from its own transcript history rather than FMP's discovery feed, which silently capped multi-year runs to about six months of trades.
 
 ---
 
@@ -62,7 +55,7 @@ The honest possibility remains that the backtest kills the signal. That would be
 
 ## The backtest
 
-The backtest runs on Financial Modeling Prep data and is independent of IBKR.
+The backtest runs on Financial Modeling Prep data and is fully self-contained — no IBKR dependency.
 
 ### Step 1 — generate candidates (expensive, run once)
 
@@ -87,7 +80,7 @@ Both scorers cache to disk (`backtest_scores.json`, `subjectivity_scores.json`).
 ### Step 2 — analyze (cheap, re-runnable)
 
 ```bash
-pip install -r requirements.txt   # adds scikit-learn vs v2
+pip install -r requirements.txt
 python backtest_analyze.py
 python backtest_analyze.py --long-only   # trigger only long-side predictions
 ```
@@ -108,7 +101,7 @@ Per fold: `StandardScaler` fit on train only → `ElasticNetCV` with `TimeSeries
 Two readouts:
 
 1. **Rank-IC** (Spearman of predicted vs realized excess over *all* test trades each month, averaged across folds) — the paired, threshold-free, intercept-invariant signal-quality comparison. This is the honest head-to-head: same test trades for every arm, no trigger threshold involved.
-2. **Pooled OOS mean net-of-cost ± 95% CI** — the economic readout. Each arm triggers a different subset, so these are not paired; read alongside the rank-IC, not instead of it.
+2. **Pooled OOS mean net-of-cost ± 95% CI** — the economic readout, with a Newey-West (Bartlett-kernel) standard error to account for the autocorrelation between overlapping holding periods. Each arm triggers a different subset, so these are not paired; read alongside the rank-IC, not instead of it.
 
 The headline is the **subjectivity vs finbert** paired monthly ΔIC at the 90d horizon. 30d and 180d run as robustness. Mean ElasticNet coefficients across folds identify which dimensions carry the edge.
 
@@ -142,70 +135,14 @@ Trains a RoBERTa encoder with six 3-class heads on [gtfintechlab/SubjECTive-QA](
 
 ---
 
-## The live pipeline (v1 lineage)
+## The live pipeline (archived at `v1.0.0`)
 
-### Setup
-
-```bash
-pip install -r requirements.txt
-playwright install chromium
-```
-
-Rebalancing requires an IBKR paper-trading gateway running locally on `127.0.0.1:7497`.
-
-### Usage
-
-**Bootstrap (first run only)** — scrape and score a large batch of historical transcripts to build up signal history.
+The original IBKR/Markowitz pipeline — scrape, score, rank, rebalance, execute — is no longer part of `master`; it was retired once the project's focus moved fully to the backtest. The code (`main.py`, `webscraper.py`, `rebalance.py`, `ibkr_manager.py`, `visualize.py`) and its usage instructions still live at the `v1.0.0` tag:
 
 ```bash
-python main.py --bootstrap --pages 100
+git checkout v1.0.0
+cat README.md   # full live-pipeline setup and usage instructions, as they were at v1
 ```
-
-**Daily run (scrape + score only)**
-
-```bash
-python main.py
-```
-
-**Daily run with rebalancing**
-
-```bash
-python main.py --rebalance                            # live
-python main.py --rebalance --dry-run                  # print target weights, place nothing
-python main.py --rebalance --portfolio-value 100000   # override auto-fetched value
-```
-
-Risk / holding parameters (optional, shown with defaults):
-
-```bash
-python main.py --rebalance \
-  --holding-days 63 \      # exit after this many trading days
-  --stop-loss-pct 0.15 \   # exit if a position drops 15% from entry
-  --take-profit-pct 0.25   # exit if a position gains 25% from entry
-```
-
-**Standalone rebalance**
-
-```bash
-python rebalance.py --today-tickers AAPL MSFT NVDA
-```
-
-**Visualize performance** (needs ≥2 days of runs)
-
-```bash
-python visualize.py
-```
-
-#### Exit rules
-
-| Condition | Trigger |
-| --------- | ------- |
-| Stop-loss | Price falls more than `stop-loss-pct` below entry |
-| Take-profit | Price rises more than `take-profit-pct` above entry |
-| Time limit | Position held for `holding-days` trading days |
-| Signal dropout | Ticker no longer in today's top-percentile universe |
-
-If a held ticker re-enters the investable universe on the same day it would have exited, its entry date and price reset (clock restart).
 
 ---
 
@@ -214,7 +151,9 @@ If a held ticker re-enters the investable universe on the same day it would have
 ```bash
 git checkout v1.0.0    # the original Markowitz/IBKR pipeline
 git checkout v2.0.0    # the first backtest harness
-git checkout master    # current work
+git checkout v3.1.0    # retail-universe testing, CAPM/CI refinements
+git checkout v3.2.0    # multi-faceted sentiment, ElasticNet, Newey-West
+git checkout master    # current work (== v3.2.0)
 ```
 
 `master` is always the current line of development; the tags are immutable snapshots.
@@ -225,17 +164,12 @@ git checkout master    # current work
 
 | File | Role |
 | ---- | ---- |
-| `webscraper.py` | Playwright scraper for Motley Fool transcripts (live pipeline) |
 | `preprocessing.py` | Split / clean / sentence-tokenize / segment Q&A pairs |
 | `sentiment_scoring.py` | FinBERT scoring and per-transcript composite |
 | `subjectivity_scoring.py` | SubjECTive-QA inference, aggregation, and cache |
 | `train_subjectivity.py` | Fine-tune the multi-task subjectivity model (one-time) |
 | `signal_constructor.py` | Field-agnostic drift signal, ranking, investable universe |
-| `rebalance.py` | Exit logic + Markowitz min-variance weights |
-| `ibkr_manager.py` | IBKR connection, pricing, order placement |
-| `main.py` | Orchestrates the live pipeline (bootstrap / daily / rebalance) |
-| `visualize.py` | Performance chart + summary |
-| `persistence.py` | JSON/CSV state for scores, positions, performance |
+| `persistence.py` | Legacy JSON/CSV state helpers from the live pipeline; unused by the current backtest scripts |
 | `fmp_client.py` | Financial Modeling Prep API wrapper (backtest) |
 | `backtest.py` | Candidate generation, subjectivity scoring, forward pricing |
 | `backtest_analyze.py` | ElasticNet walk-forward, three-arm OOS comparison, verdict |
@@ -243,6 +177,8 @@ git checkout master    # current work
 | `runpod_setup_backtest.sh` | RunPod provisioning (both scorers, current) |
 | `runpod_setup_subjectivity.sh` | RunPod provisioning (subjectivity model training) |
 
+The live pipeline's files (`main.py`, `webscraper.py`, `rebalance.py`, `ibkr_manager.py`, `visualize.py`) are not present on `master` — see [The live pipeline](#the-live-pipeline-archived-at-v100) above.
+
 ## Generated files (gitignored)
 
-`transcript_scores.json`, `positions.json`, `signals_output.csv`, `performance_log.csv`, `performance_chart.png`, and the backtest artifacts: `backtest_trades.csv`, `backtest_summary.csv`, `backtest_scores.json`, `backtest_figure.png`, `subjectivity_scores.json`, `subjectivity_model/`.
+Backtest artifacts: `backtest_trades.csv`, `backtest_summary.csv`, `backtest_scores.json`, `backtest_figure.png`, `subjectivity_scores.json`, `subjectivity_model/`.
